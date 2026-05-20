@@ -1,10 +1,4 @@
-"""
-Standalone Sandbox Service
-
-This service runs on a separate machine and handles sandbox execution requests.
-It receives code and texts to compress, runs them in isolated Docker containers,
-and stores the results in S3.
-"""
+"""Standalone sandbox service for asynchronous compact-bench execution."""
 from __future__ import annotations
 
 import asyncio
@@ -21,10 +15,11 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from dotenv import load_dotenv
 from soma_shared.contracts.sandbox.v1.messages import (
-    ExecuteBatchRequest,
-    ExecuteBatchResponse,
+    CompactBenchReportRequest,
+    CompactBenchRunTaskRequest,
+    CompactBenchRunTaskResponse,
 )
-from app.sandbox_executor import SandboxExecutor
+from app.compact_bench_executor import CompactBenchExecutor
 
 
 # Load environment variables from .env file
@@ -47,148 +42,160 @@ app = FastAPI(
 )
 
 
-# Sandbox executor
 @app.on_event("startup")
 async def startup():
-    """Initialize sandbox executor on startup."""
-    get_sandbox_executor()
-    max_concurrent = int(min(12, os.cpu_count() - 1)) 
+    """Initialize compact-bench executor and shared capacity controls."""
+    get_compact_bench_executor()
+    cpu_count = os.cpu_count() or 2
+    max_concurrent = int(min(12, max(1, cpu_count - 1)))
     app.state.sandbox_semaphore = asyncio.Semaphore(max_concurrent)
     logger.info("Sandbox semaphore initialized with max_concurrent=%d", max_concurrent)
 
 
-def get_sandbox_executor() -> SandboxExecutor:
-    """Get or create sandbox executor instance."""
-    if not hasattr(app.state, "sandbox_executor"):
-        image = os.getenv("SANDBOX_IMAGE", "sandbox-runner:local")
-        force_rebuild = os.getenv("SANDBOX_FORCE_REBUILD", "false").lower() == "true"
-        app.state.sandbox_executor = SandboxExecutor(image=image, auto_build=True)
-        # Ensure image is built on startup (force rebuild if flag is set)
-        app.state.sandbox_executor.ensure_image(force_rebuild=force_rebuild)
-        if force_rebuild:
-            logger.info("Sandbox image force rebuild completed")
-    return app.state.sandbox_executor
+def get_compact_bench_executor() -> CompactBenchExecutor:
+    """Get or create compact-bench executor instance."""
+    if not hasattr(app.state, "compact_bench_executor"):
+        app.state.compact_bench_executor = CompactBenchExecutor()
+    return app.state.compact_bench_executor
 
 
-@app.post("/execute_batch", response_model=ExecuteBatchResponse)
-async def execute_batch(request: ExecuteBatchRequest) -> ExecuteBatchResponse:
-    """Execute a batch of compression tasks in sandbox.
-
-    This endpoint:
-    1. Fetches the miner's challenge script via a presigned S3 URL (read-only, scoped access)
-    2. Runs it in an isolated Docker container
-    3. Uploads compressed results via per-task presigned S3 URLs (write-only, scoped access)
-    4. Returns success status
-    """
+async def _acquire_capacity_slot(*, operation_kind: str, operation_id: str) -> None:
     semaphore: asyncio.Semaphore = app.state.sandbox_semaphore
     try:
         async with asyncio.timeout(0):
             await semaphore.acquire()
     except (asyncio.TimeoutError, TimeoutError):
         logger.warning(
-            "Sandbox service at capacity, rejecting batch: batch_id=%s",
-            request.batch_id,
+            "%s service at capacity, rejecting request: id=%s",
+            operation_kind,
+            operation_id,
         )
         raise HTTPException(
             status_code=429,
-            detail="Sandbox service is at capacity. Please try again later.",
+            detail=f"{operation_kind} service is at capacity. Please try again later.",
         )
 
-    logger.info(
-        "Received batch execution request: batch_id=%s, texts=%d",
-        request.batch_id,
-        len(request.challenge_texts),
-    )
 
+def _release_capacity_slot() -> None:
+    semaphore: asyncio.Semaphore = app.state.sandbox_semaphore
+    semaphore.release()
+
+
+def _get_compact_bench_report_url() -> str:
+    report_url = os.getenv("COMPACT_BENCH_REPORT_URL", "").strip()
+    if not report_url:
+        raise RuntimeError("COMPACT_BENCH_REPORT_URL must be set for compact-bench callbacks")
+    return report_url
+
+
+def _get_compact_bench_report_timeout() -> float:
+    raw_timeout = os.getenv("COMPACT_BENCH_REPORT_TIMEOUT_SECONDS", "15")
     try:
-        # Fetch miner challenge code via presigned GET URL — no S3 credentials needed.
-        async with httpx.AsyncClient() as http_client:
-            script_response = await http_client.get(
-                request.script_presigned_url,
-                follow_redirects=True,
-            )
-            script_response.raise_for_status()
-        challenge_code = script_response.text
-        logging.info(
-            "Fetched challenge code for batch_id=%s via presigned URL, length=%d",
-            request.batch_id,
-            len(challenge_code),
+        timeout = float(raw_timeout)
+    except ValueError:
+        timeout = 15.0
+    return max(1.0, timeout)
+
+
+async def _send_compact_bench_report(report: CompactBenchReportRequest) -> None:
+    report_url = _get_compact_bench_report_url()
+    async with httpx.AsyncClient() as http_client:
+        response = await http_client.post(
+            report_url,
+            json=report.model_dump(mode="json"),
+            timeout=_get_compact_bench_report_timeout(),
+        )
+        response.raise_for_status()
+
+
+async def _execute_compact_bench_task_in_background(request: CompactBenchRunTaskRequest) -> None:
+    try:
+        executor = get_compact_bench_executor()
+        output = await asyncio.to_thread(
+            executor.execute_task,
+            batch_id=str(request.run_id),
+            task=request,
+            timeout_per_task=request.openclaw_timeout,
         )
 
-        # Get sandbox executor
-        executor = get_sandbox_executor()
-
-        # Execute sandbox
-        compressed_texts, task_errors, execution_times = await executor.execute_batch(
-            challenge_code=challenge_code,
-            challenge_texts=request.challenge_texts,
-            compression_ratios=request.compression_ratios,
-            timeout_per_task=request.timeout_per_task,
-            container_timeout=request.container_timeout,
-        )
-
-        # Upload each compressed result via its presigned PUT URL — scoped write access only.
-        # Skip uploading empty strings for failed tasks to avoid S3 clutter.
-        uploaded_count = 0
-        skipped_count = 0
-        async with httpx.AsyncClient() as http_client:
-            for idx, (presigned_url, compressed_text) in enumerate(zip(
-                request.storage_presigned_urls, compressed_texts
-            )):
-                # Skip uploading empty results (failed tasks)
-                if not compressed_text or not compressed_text.strip():
-                    skipped_count += 1
-                    logger.debug(
-                        "Skipping S3 upload for empty result: batch_id=%s, idx=%d",
-                        request.batch_id,
-                        idx,
+        patch_capture_status = False
+        report_error = output.report.error
+        if output.patch_text.strip():
+            try:
+                async with httpx.AsyncClient() as http_client:
+                    put_resp = await http_client.put(
+                        request.storage_presigned_url,
+                        content=output.patch_text.encode("utf-8"),
                     )
-                    continue
-                
-                put_resp = await http_client.put(
-                    presigned_url,
-                    content=compressed_text.encode("utf-8"),
+                    put_resp.raise_for_status()
+                patch_capture_status = True
+            except Exception as exc:
+                report_error = (
+                    f"{report_error}; patch upload failed: {exc}"
+                    if report_error
+                    else f"patch upload failed: {exc}"
                 )
-                put_resp.raise_for_status()
-                uploaded_count += 1
+        else:
+            patch_capture_status = output.report.ok_status
 
-        logger.info(
-            "Batch execution completed: batch_id=%s, uploaded=%d, skipped=%d",
-            request.batch_id,
-            uploaded_count,
-            skipped_count,
+        report = output.report.model_copy(
+            update={
+                "error": report_error,
+                "patch_capture_status": patch_capture_status,
+            }
         )
-        failed_count = sum(1 for e in task_errors if e)
-        if failed_count:
-            logger.warning(
-                "Batch completed with %d/%d task failures: batch_id=%s",
-                failed_count,
-                len(task_errors),
-                request.batch_id,
-            )
-
-        return ExecuteBatchResponse(
-            success=True,
-            batch_id=request.batch_id,
-            task_errors=task_errors,
-            execution_times=execution_times,
-        )
-
+        await _send_compact_bench_report(report)
     except Exception as exc:
         tb = traceback.format_exc()
         logger.error(
-            "Batch execution failed: batch_id=%s, error=%s\n%s",
-            request.batch_id,
+            "Compact-bench task failed before reporting: run_id=%s, error=%s\n%s",
+            request.run_id,
             str(exc),
             tb,
         )
-        return ExecuteBatchResponse(
-            success=False,
-            batch_id=request.batch_id,
-            error=f"{type(exc).__name__}: {exc}\n\n{tb}",
+        fallback_report = CompactBenchReportRequest(
+            run_id=request.run_id,
+            ok_status=False,
+            error=f"{type(exc).__name__}: {exc}",
+            execution_time_seconds=None,
+            total_tokens=None,
+            patch_capture_status=False,
+            patch_diff=None,
+            metadata={
+                "benchmark": request.benchmark,
+                "instance_id": request.instance_id,
+                "traceback": tb,
+            },
         )
+        try:
+            await _send_compact_bench_report(fallback_report)
+        except Exception:
+            logger.exception(
+                "Compact-bench report callback failed irrecoverably",
+                extra={"run_id": request.run_id},
+            )
     finally:
-        semaphore.release()
+        _release_capacity_slot()
+
+@app.post("/run_compact_bench_task", response_model=CompactBenchRunTaskResponse)
+async def run_compact_bench_task(
+    request: CompactBenchRunTaskRequest,
+) -> CompactBenchRunTaskResponse:
+    """Accept a compact-bench task for asynchronous execution and callback reporting."""
+
+    _get_compact_bench_report_url()
+    await _acquire_capacity_slot(
+        operation_kind="Compact-bench",
+        operation_id=str(request.run_id),
+    )
+    logger.info(
+        "Accepted compact-bench task: run_id=%s benchmark=%s instance_id=%s",
+        request.run_id,
+        request.benchmark,
+        request.instance_id,
+    )
+    asyncio.create_task(_execute_compact_bench_task_in_background(request))
+    return CompactBenchRunTaskResponse(success=True)
 
 
 @app.get("/health")

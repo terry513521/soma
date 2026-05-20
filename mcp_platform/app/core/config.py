@@ -4,7 +4,7 @@ import json
 import subprocess
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import quote
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -148,17 +148,12 @@ class Settings(BaseSettings):
     sandbox_timeout_per_task_seconds: float = Field(
         default=10.0,
         alias="SANDBOX_TIMEOUT_PER_TASK_SECONDS",
-        description="Timeout for executing one compression task",
+        description="Maximum execution time forwarded to one sandbox task",
     )
-    sandbox_container_timeout_offset: float = Field(
+    sandbox_submission_timeout_seconds: float = Field(
         default=10.0,
-        alias="SANDBOX_CONTAINER_TIMEOUT_OFFSET",
-        description="Extra time for container overhead (startup, I/O, etc.)",
-    )
-    sandbox_request_timeout_offset: float = Field(
-        default=20.0,
-        alias="SANDBOX_REQUEST_TIMEOUT_OFFSET",
-        description="Extra time for HTTP request (must be > container offset)",
+        alias="SANDBOX_SUBMISSION_TIMEOUT_SECONDS",
+        description="Timeout for waiting on sandbox task acceptance response",
     )
 
     # Validator stake requirements
@@ -180,6 +175,10 @@ class Settings(BaseSettings):
     sandbox_service_url: str = Field(
         ...,
         alias="SANDBOX_SERVICE_URL",
+    )
+    compact_bench_service_url: str | None = Field(
+        default=None,
+        alias="COMPACT_BENCH_SERVICE_URL",
     )
 
     @field_validator("log_levels", mode="before")
