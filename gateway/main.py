@@ -1,21 +1,16 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
+from typing import AsyncIterator
 
 import boto3
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import Response, StreamingResponse
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
-
-from soma_shared.contracts.sandbox.v1.messages import (
-    ApiGatewayProxyPayload,
-    ApiGatewayRequest,
-    ApiGatewayResponse,
-)
 
 
 logger = logging.getLogger("soma.gateway")
@@ -27,7 +22,7 @@ logging.basicConfig(
 
 app = FastAPI(
     title="SOMA Gateway",
-    description="Gateway service that proxies requests using S3 + secret store",
+    description="Gateway service that proxies OpenAI-compatible requests",
     version="1.0.0",
 )
 
@@ -84,6 +79,11 @@ def _resolve_api_key_from_ssm(api_key_path: str) -> str:
     return value
 
 
+def _resolve_upstream_url(path: str) -> str:
+    base_url = os.getenv("GATEWAY_UPSTREAM_BASE_URL", "https://openrouter.ai/api/v1")
+    return f"{base_url.rstrip('/')}/{path.lstrip('/')}"
+
+
 async def _resolve_api_key_path_from_db(run_id: int) -> str:
     engine: AsyncEngine = app.state.db_engine
     query = text(
@@ -106,14 +106,15 @@ async def _resolve_api_key_path_from_db(run_id: int) -> str:
     return str(api_key_path)
 
 
-def _build_request_content(payload: ApiGatewayProxyPayload) -> str | bytes | None:
-    if payload.body is None:
-        return None
-
-    if isinstance(payload.body, str):
-        return payload.body
-
-    return json.dumps(payload.body)
+def _extract_forward_headers(request: Request) -> dict[str, str]:
+    skip = {"host", "content-length", "authorization"}
+    headers: dict[str, str] = {}
+    for key, value in request.headers.items():
+        lower = key.lower()
+        if lower in skip or lower.startswith("x-run-id"):
+            continue
+        headers[key] = value
+    return headers
 
 
 @app.get("/health")
@@ -121,66 +122,94 @@ async def health() -> dict[str, str]:
     return {"status": "healthy", "service": "gateway"}
 
 
-@app.post("/proxy", response_model=ApiGatewayResponse)
-async def proxy(request: ApiGatewayRequest) -> ApiGatewayResponse:
-    payload = request.body
-
-    headers = dict(payload.headers)
-
+async def _resolve_authorization_header(run_id: int) -> str:
     try:
-        api_key_path = await _resolve_api_key_path_from_db(request.run_id)
+        api_key_path = await _resolve_api_key_path_from_db(run_id)
         api_key_value = await asyncio.to_thread(_resolve_api_key_from_ssm, api_key_path)
     except Exception as exc:
-        logger.exception("Failed to resolve API key for run_id=%s", request.run_id)
-        return ApiGatewayResponse(
-            success=False,
-            error=f"API key resolution failed: {exc}",
-        )
-    headers["Authorization"] = f"Bearer {api_key_value}"
+        logger.exception("Failed to resolve API key for run_id=%s", run_id)
+        raise HTTPException(status_code=400, detail=f"API key resolution failed: {exc}") from exc
+    return f"Bearer {api_key_value}"
 
+
+async def _stream_upstream_response(
+    method: str,
+    url: str,
+    headers: dict[str, str],
+    body_bytes: bytes,
+    timeout: httpx.Timeout,
+) -> tuple[AsyncIterator[bytes], int, dict[str, str]]:
+    client = httpx.AsyncClient(timeout=timeout)
+    stream_ctx = client.stream(method=method, url=url, headers=headers, content=body_bytes)
+    response = await stream_ctx.__aenter__()
+
+    async def _iterator() -> AsyncIterator[bytes]:
+        try:
+            async for chunk in response.aiter_bytes():
+                yield chunk
+        finally:
+            await stream_ctx.__aexit__(None, None, None)
+            await client.aclose()
+
+    response_headers = {
+        "content-type": response.headers.get("content-type", "text/event-stream"),
+        "x-request-id": response.headers.get("x-request-id", ""),
+    }
+    return _iterator(), response.status_code, response_headers
+
+
+@app.api_route("/v1/{path:path}", methods=["POST"])
+async def proxy_openai_compatible(
+    path: str,
+    request: Request,
+    x_run_id: str | None = Header(default=None, alias="X-Run-Id"),
+) -> Response:
+    if not x_run_id:
+        raise HTTPException(status_code=400, detail="Missing required header: X-Run-Id")
     try:
-        content = await asyncio.to_thread(_build_request_content, payload)
-    except Exception as exc:
-        logger.exception("Failed to resolve proxy body for run_id=%s", request.run_id)
-        return ApiGatewayResponse(
-            success=False,
-            error=f"Body resolution failed: {exc}",
+        run_id = int(x_run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="X-Run-Id must be an integer") from exc
+
+    headers = _extract_forward_headers(request)
+    headers["Authorization"] = await _resolve_authorization_header(run_id)
+
+    body_bytes = await request.body()
+    try:
+        parsed = await request.json()
+    except Exception:
+        parsed = None
+
+    url = _resolve_upstream_url(path)
+    timeout = httpx.Timeout(float(os.getenv("GATEWAY_UPSTREAM_TIMEOUT_SECONDS", "60")))
+
+    if isinstance(parsed, dict) and bool(parsed.get("stream")):
+        stream, status_code, response_headers = await _stream_upstream_response(
+            method="POST",
+            url=url,
+            headers=headers,
+            body_bytes=body_bytes,
+            timeout=timeout,
+        )
+        return StreamingResponse(
+            stream,
+            status_code=status_code,
+            media_type=response_headers.get("content-type", "text/event-stream"),
+            headers={"x-request-id": response_headers.get("x-request-id", "")},
         )
 
-    timeout = httpx.Timeout(payload.timeout_seconds)
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.request(
-                method=payload.method.upper(),
-                url=payload.url,
-                headers=headers,
-                content=content,
-            )
+            resp = await client.post(url, headers=headers, content=body_bytes)
     except Exception as exc:
-        logger.exception("Upstream request failed for run_id=%s", request.run_id)
-        return ApiGatewayResponse(
-            success=False,
-            error=f"Upstream request failed: {exc}",
-        )
+        logger.exception("Upstream request failed for run_id=%s", run_id)
+        raise HTTPException(status_code=502, detail=f"Upstream request failed: {exc}") from exc
 
-    response_body = resp.text
-    response_headers = {
-        "content-type": resp.headers.get("content-type", ""),
-        "x-request-id": resp.headers.get("x-request-id", ""),
-    }
-    if not resp.is_success:
-        return ApiGatewayResponse(
-            success=False,
-            error=f"Upstream status {resp.status_code}",
-            status_code=resp.status_code,
-            headers=response_headers,
-            body=response_body,
-        )
-    return ApiGatewayResponse(
-        success=True,
+    return Response(
+        content=resp.content,
         status_code=resp.status_code,
-        headers=response_headers,
-        body=response_body,
+        media_type=resp.headers.get("content-type"),
+        headers={"x-request-id": resp.headers.get("x-request-id", "")},
     )
 
 
