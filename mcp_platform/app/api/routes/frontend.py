@@ -380,6 +380,22 @@ def _to_optional_float(value: object) -> float | None:
     return float(value)
 
 
+def _average_optional_int(values: list[int | None]) -> float | None:
+    present_values = [value for value in values if value is not None]
+    if not present_values:
+        return None
+    return sum(present_values) / len(present_values)
+
+
+def _summarize_baseline_pass(baseline_runs: dict[int, dict[str, object]]) -> bool | None:
+    if not baseline_runs:
+        return None
+    resolved_values = {baseline["resolved"] for baseline in baseline_runs.values()}
+    if len(resolved_values) != 1:
+        return None
+    return next(iter(resolved_values))
+
+
 async def _ensure_competition_exists(db: AsyncSession, comp_id: int) -> None:
     comp_name = await db.scalar(
         select(Competition.competition_name).where(Competition.id == comp_id)
@@ -488,31 +504,63 @@ def _build_swe_task_groups(rows: list[sa.Row]) -> dict[str, dict[str, object]]:
                 "task_name": task_name,
                 "is_screener": bool(row.is_screener),
                 "hotkey": str(row.hotkey),
-                "baseline_run_id": _to_optional_int(row.baseline_run_id),
-                "baseline_tokens_used": _to_optional_int(row.baseline_tokens_used),
-                "baseline_resolved": row.baseline_resolved,
-                "runs": [],
+                "baseline_runs": {},
+                "runs_by_id": {},
             },
         )
 
-        run_score = _compute_swe_run_score(
-            row.baseline_resolved,
-            row.run_resolved,
-            _to_optional_int(row.baseline_tokens_used),
-            _to_optional_int(row.run_tokens_used),
-        )
+        baseline_run_id = _to_optional_int(row.baseline_run_id)
+        if baseline_run_id is not None:
+            group["baseline_runs"][baseline_run_id] = {
+                "resolved": row.baseline_resolved,
+                "tokens_used": _to_optional_int(row.baseline_tokens_used),
+            }
 
-        group["runs"].append(
+        run_id = _to_optional_int(row.run_id)
+        if run_id is None:
+            continue
+
+        run_item = group["runs_by_id"].setdefault(
+            run_id,
             {
-                "run_id": _to_optional_int(row.run_id),
+                "run_id": run_id,
                 "attempt_no": _to_optional_int(row.attempt_no) or 0,
                 "pass_with_compression": row.run_resolved,
                 "tokens_with_compression": _to_optional_int(row.run_tokens_used),
-                "platform_score": run_score,
                 "time_taken_seconds": _to_optional_float(row.time_taken_seconds),
                 "agent_steps": _to_optional_int(row.agent_steps),
-            }
+                "baseline_scores": [],
+            },
         )
+
+        run_item["baseline_scores"].append(
+            _compute_swe_run_score(
+                row.baseline_resolved,
+                row.run_resolved,
+                _to_optional_int(row.baseline_tokens_used),
+                _to_optional_int(row.run_tokens_used),
+            )
+        )
+
+    for group in tasks.values():
+        finalized_runs: list[dict[str, object]] = []
+        for run in group["runs_by_id"].values():
+            baseline_scores = list(run.pop("baseline_scores"))
+            run["platform_score"] = (
+                sum(baseline_scores) / len(baseline_scores) if baseline_scores else None
+            )
+            finalized_runs.append(run)
+        group["runs"] = finalized_runs
+        group["baseline_pass_without_compression"] = _summarize_baseline_pass(
+            group["baseline_runs"]
+        )
+        group["baseline_tokens_without_compression"] = _average_optional_int(
+            [
+                baseline["tokens_used"]
+                for baseline in group["baseline_runs"].values()
+            ]
+        )
+        group.pop("runs_by_id")
 
     return tasks
 
@@ -529,9 +577,13 @@ def _build_swe_task_result_item(group: dict[str, object]) -> SweMinerTaskResultI
     return SweMinerTaskResultItem(
         task_name=str(group["task_name"]),
         is_screener=bool(group["is_screener"]),
-        pass_without_compression=group["baseline_resolved"],
+        pass_without_compression=group["baseline_pass_without_compression"],
         pass_with_compression=(runs[0]["pass_with_compression"] if len(runs) == 1 else None),
-        tokens_without_compression=_to_optional_int(group["baseline_tokens_used"]),
+        tokens_without_compression=(
+            int(group["baseline_tokens_without_compression"])
+            if group["baseline_tokens_without_compression"] is not None
+            else None
+        ),
         tokens_with_compression=(
             sum(compressed_tokens) / len(compressed_tokens) if compressed_tokens else None
         ),
@@ -1855,8 +1907,12 @@ async def get_swe_miner_task_runs(
     return SweMinerTaskRunsResponse(
         task_name=task_name,
         is_screener=bool(task_group["is_screener"]),
-        pass_without_compression=task_group["baseline_resolved"],
-        tokens_without_compression=_to_optional_int(task_group["baseline_tokens_used"]),
+        pass_without_compression=task_group["baseline_pass_without_compression"],
+        tokens_without_compression=(
+            int(task_group["baseline_tokens_without_compression"])
+            if task_group["baseline_tokens_without_compression"] is not None
+            else None
+        ),
         runs=[
             SweMinerTaskRunItem(
                 run_id=int(run["run_id"] or 0),
