@@ -61,7 +61,7 @@ def _ssm_client():
 
 
 def _resolve_ssm_parameter_name(api_key_path: str) -> str:
-    prefix = os.getenv("GATEWAY_SSM_PREFIX", "/s114/dev")
+    prefix = os.getenv("OPENROUTER_SSM_PREFIX", "/s114/dev")
     clean_prefix = prefix.rstrip("/")
     clean_suffix = api_key_path.strip("/")
     if not clean_suffix:

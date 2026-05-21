@@ -277,11 +277,7 @@ def _get_ssm_client():
 
 
 def _openrouter_ssm_prefix() -> str:
-    return (
-        os.getenv("OPENROUTER_SSM_PREFIX")
-        or os.getenv("GATEWAY_SSM_PREFIX")
-        or "/s114/dev"
-    ).rstrip("/")
+    return settings.openrouter_ssm_prefix.rstrip("/")
 
 
 def _build_openrouter_secret_ref(miner_hotkey: str) -> str:
