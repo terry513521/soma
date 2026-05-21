@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import logging
+import hashlib
+import asyncio
 from datetime import datetime, timezone
 
+from sqlalchemy import select, text
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -11,9 +14,16 @@ from soma_shared.contracts.common.signatures import SignedEnvelope
 from soma_shared.contracts.miner.v1.messages import (
     UploadSolutionRequest,
     UploadSolutionResponse,
+    AddOpenRouterApiKeyRequest,
+    AddOpenRouterApiKeyResponse,
+    UpdateOpenRouterApiKeyRequest,
+    UpdateOpenRouterApiKeyResponse,
+    DeleteOpenRouterApiKeyRequest,
+    DeleteOpenRouterApiKeyResponse,
 )
 from soma_shared.db.session import get_db_session
 from soma_shared.db.miner_log import log_miner_message
+from soma_shared.db.models.miner import Miner
 from app.db.interfaces.miner_queries import (
     acquire_miner_upload_advisory_lock,
     get_latest_active_competition_and_timeframe,
@@ -28,6 +38,7 @@ from app.services.script_store import (
     DuplicateMinerUploadError,
     store_hot_script,
 )
+from app.services.ssm.client import get_ssm_client
 from soma_shared.utils.signer import generate_nonce, sign_payload_model
 from app.core.config import settings
 from app.core.logging import get_logger
@@ -241,6 +252,129 @@ async def _acquire_miner_upload_lock(
         miner_hotkey=miner_hotkey,
         competition_id=competition_id,
     )
+
+
+async def _acquire_miner_openrouter_key_lock(
+    db: AsyncSession,
+    *,
+    miner_hotkey: str,
+) -> None:
+    bind = db.get_bind()
+    if bind.dialect.name != "postgresql":
+        return
+    lock_key = f"miner-openrouter-key:{miner_hotkey}"
+    await db.execute(
+        text("SELECT pg_advisory_xact_lock(hashtext(:lock_key))"),
+        {"lock_key": lock_key},
+    )
+
+
+def _openrouter_ssm_prefix() -> str:
+    return settings.openrouter_ssm_prefix.rstrip("/")
+
+
+def _build_openrouter_secret_ref(miner_hotkey: str) -> str:
+    return f"miners/{miner_hotkey}/openrouter_api_key"
+
+
+def _build_ssm_parameter_name(secret_ref: str) -> str:
+    return f"{_openrouter_ssm_prefix()}/{secret_ref.strip('/')}"
+
+
+def _put_openrouter_key_to_ssm(secret_ref: str, api_key: str) -> None:
+    client = get_ssm_client()
+    client.put_parameter(
+        Name=_build_ssm_parameter_name(secret_ref),
+        Value=api_key,
+        Type="SecureString",
+        Overwrite=True,
+        Tier="Standard",
+    )
+
+
+def _delete_openrouter_key_from_ssm(secret_ref: str) -> None:
+    client = get_ssm_client()
+    try:
+        client.delete_parameter(Name=_build_ssm_parameter_name(secret_ref))
+    except client.exceptions.ParameterNotFound:
+        return
+
+
+def _get_openrouter_key_from_ssm(secret_ref: str) -> str | None:
+    client = get_ssm_client()
+    try:
+        resp = client.get_parameter(
+            Name=_build_ssm_parameter_name(secret_ref),
+            WithDecryption=True,
+        )
+    except client.exceptions.ParameterNotFound:
+        return None
+    value = (resp.get("Parameter") or {}).get("Value")
+    if not isinstance(value, str):
+        return None
+    return value
+
+
+def _openrouter_key_fingerprint(api_key: str) -> str:
+    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+
+
+async def _ensure_miner_row(db: AsyncSession, miner_hotkey: str) -> Miner:
+    miner = await db.scalar(select(Miner).where(Miner.ss58 == miner_hotkey).limit(1))
+    if miner is not None:
+        return miner
+    miner = Miner(ss58=miner_hotkey, created_at=datetime.now(timezone.utc))
+    db.add(miner)
+    await db.flush()
+    return miner
+
+
+async def _get_openrouter_key_row(db: AsyncSession, miner_fk: int) -> tuple[int, str] | None:
+    row = (
+        await db.execute(
+            text(
+                """
+                SELECT id, secret_ref
+                FROM miner_openrouter_api_keys
+                WHERE miner_fk = :miner_fk
+                  AND revoked_at IS NULL
+                LIMIT 1
+                """
+            ),
+            {"miner_fk": miner_fk},
+        )
+    ).first()
+    if not row:
+        return None
+    return int(row[0]), str(row[1])
+
+
+async def _signed_miner_response(
+    request: Request,
+    db: AsyncSession,
+    signer_ss58: str,
+    response_payload,
+) -> SignedEnvelope:
+    response_nonce = generate_nonce()
+    response_sig = sign_payload_model(
+        response_payload,
+        nonce=response_nonce,
+        wallet=settings.wallet,
+    )
+    response = SignedEnvelope(payload=response_payload, sig=response_sig)
+    await log_miner_message(
+        db,
+        direction="response",
+        endpoint=request.url.path,
+        method=request.method,
+        signature=response_sig.signature,
+        nonce=response_sig.nonce,
+        signer_ss58=signer_ss58,
+        request_id=getattr(request.state, "request_id", None),
+        payload=response_payload.model_dump(mode="json"),
+        status_code=status.HTTP_200_OK,
+    )
+    return response
 
 
 @router.post(
@@ -473,3 +607,215 @@ async def upload_miner_script(
     )
 
     return response
+
+
+@router.post(
+    "/miner/openrouter-key/add",
+    response_model=SignedEnvelope[AddOpenRouterApiKeyResponse],
+    status_code=status.HTTP_200_OK,
+)
+async def add_openrouter_api_key(
+    request: Request,
+    _req: SignedEnvelope[AddOpenRouterApiKeyRequest] = Depends(
+        verify_miner_request_dep_tz(AddOpenRouterApiKeyRequest)
+    ),
+    db: AsyncSession = Depends(get_db_session),
+) -> SignedEnvelope[AddOpenRouterApiKeyResponse]:
+    payload = _req.payload
+    if payload.miner_hotkey != _req.sig.signer_ss58:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Miner hotkey does not match signature")
+    if not settings.debug:
+        snapshot = _get_metagraph_snapshot(request)
+        _ensure_miner_registered(snapshot=snapshot, signer_ss58=_req.sig.signer_ss58)
+    await _ensure_miner_not_banned(db, miner_hotkey=payload.miner_hotkey)
+    await _acquire_miner_openrouter_key_lock(db, miner_hotkey=payload.miner_hotkey)
+
+    miner = await _ensure_miner_row(db, payload.miner_hotkey)
+    existing = await _get_openrouter_key_row(db, miner.id)
+    if existing is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="OpenRouter key already exists for miner")
+
+    secret_ref = _build_openrouter_secret_ref(payload.miner_hotkey)
+    ssm_written = False
+    try:
+        await asyncio.to_thread(_put_openrouter_key_to_ssm, secret_ref, payload.api_key)
+        ssm_written = True
+        await db.execute(
+            text(
+                """
+                INSERT INTO miner_openrouter_api_keys (
+                    miner_fk, secret_backend, secret_ref, key_fingerprint, created_at, updated_at, revoked_at
+                ) VALUES (
+                    :miner_fk, :secret_backend, :secret_ref, :key_fingerprint, :created_at, :updated_at, NULL
+                )
+                """
+            ),
+            {
+                "miner_fk": miner.id,
+                "secret_backend": "aws_ssm_parameter_store",
+                "secret_ref": secret_ref,
+                "key_fingerprint": _openrouter_key_fingerprint(payload.api_key),
+                "created_at": datetime.now(timezone.utc),
+                "updated_at": datetime.now(timezone.utc),
+            },
+        )
+        await db.commit()
+    except Exception as exc:
+        await db.rollback()
+        if ssm_written:
+            try:
+                await asyncio.to_thread(_delete_openrouter_key_from_ssm, secret_ref)
+            except Exception:
+                logger.exception(
+                    "openrouter_add_compensation_failed",
+                    extra={"miner_hotkey": payload.miner_hotkey},
+                )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to add OpenRouter key: {exc}",
+        ) from exc
+    return await _signed_miner_response(
+        request,
+        db,
+        _req.sig.signer_ss58,
+        AddOpenRouterApiKeyResponse(ok=True),
+    )
+
+
+@router.post(
+    "/miner/openrouter-key/update",
+    response_model=SignedEnvelope[UpdateOpenRouterApiKeyResponse],
+    status_code=status.HTTP_200_OK,
+)
+async def update_openrouter_api_key(
+    request: Request,
+    _req: SignedEnvelope[UpdateOpenRouterApiKeyRequest] = Depends(
+        verify_miner_request_dep_tz(UpdateOpenRouterApiKeyRequest)
+    ),
+    db: AsyncSession = Depends(get_db_session),
+) -> SignedEnvelope[UpdateOpenRouterApiKeyResponse]:
+    payload = _req.payload
+    if payload.miner_hotkey != _req.sig.signer_ss58:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Miner hotkey does not match signature")
+    if not settings.debug:
+        snapshot = _get_metagraph_snapshot(request)
+        _ensure_miner_registered(snapshot=snapshot, signer_ss58=_req.sig.signer_ss58)
+    await _acquire_miner_openrouter_key_lock(db, miner_hotkey=payload.miner_hotkey)
+
+    miner = await _ensure_miner_row(db, payload.miner_hotkey)
+    existing = await _get_openrouter_key_row(db, miner.id)
+    if existing is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="OpenRouter key not found for miner")
+    key_row_id, secret_ref = existing
+
+    previous_ssm_value = await asyncio.to_thread(_get_openrouter_key_from_ssm, secret_ref)
+    ssm_updated = False
+    try:
+        await asyncio.to_thread(_put_openrouter_key_to_ssm, secret_ref, payload.api_key)
+        ssm_updated = True
+        await db.execute(
+            text(
+                """
+                UPDATE miner_openrouter_api_keys
+                SET key_fingerprint = :key_fingerprint,
+                    updated_at = :updated_at,
+                    revoked_at = NULL
+                WHERE id = :id
+                """
+            ),
+            {
+                "id": key_row_id,
+                "key_fingerprint": _openrouter_key_fingerprint(payload.api_key),
+                "updated_at": datetime.now(timezone.utc),
+            },
+        )
+        await db.commit()
+    except Exception as exc:
+        await db.rollback()
+        if ssm_updated:
+            try:
+                if previous_ssm_value is None:
+                    await asyncio.to_thread(_delete_openrouter_key_from_ssm, secret_ref)
+                else:
+                    await asyncio.to_thread(
+                        _put_openrouter_key_to_ssm,
+                        secret_ref,
+                        previous_ssm_value,
+                    )
+            except Exception:
+                logger.exception(
+                    "openrouter_update_compensation_failed",
+                    extra={"miner_hotkey": payload.miner_hotkey},
+                )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to update OpenRouter key: {exc}",
+        ) from exc
+    return await _signed_miner_response(
+        request,
+        db,
+        _req.sig.signer_ss58,
+        UpdateOpenRouterApiKeyResponse(ok=True),
+    )
+
+
+@router.post(
+    "/miner/openrouter-key/delete",
+    response_model=SignedEnvelope[DeleteOpenRouterApiKeyResponse],
+    status_code=status.HTTP_200_OK,
+)
+async def delete_openrouter_api_key(
+    request: Request,
+    _req: SignedEnvelope[DeleteOpenRouterApiKeyRequest] = Depends(
+        verify_miner_request_dep_tz(DeleteOpenRouterApiKeyRequest)
+    ),
+    db: AsyncSession = Depends(get_db_session),
+) -> SignedEnvelope[DeleteOpenRouterApiKeyResponse]:
+    payload = _req.payload
+    if payload.miner_hotkey != _req.sig.signer_ss58:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Miner hotkey does not match signature")
+    if not settings.debug:
+        snapshot = _get_metagraph_snapshot(request)
+        _ensure_miner_registered(snapshot=snapshot, signer_ss58=_req.sig.signer_ss58)
+    await _acquire_miner_openrouter_key_lock(db, miner_hotkey=payload.miner_hotkey)
+
+    miner = await _ensure_miner_row(db, payload.miner_hotkey)
+    existing = await _get_openrouter_key_row(db, miner.id)
+    if existing is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="OpenRouter key not found for miner")
+    key_row_id, secret_ref = existing
+
+    previous_ssm_value = await asyncio.to_thread(_get_openrouter_key_from_ssm, secret_ref)
+    ssm_deleted = False
+    try:
+        await asyncio.to_thread(_delete_openrouter_key_from_ssm, secret_ref)
+        ssm_deleted = True
+        await db.execute(
+            text("DELETE FROM miner_openrouter_api_keys WHERE id = :id"),
+            {"id": key_row_id},
+        )
+        await db.commit()
+    except Exception as exc:
+        await db.rollback()
+        if ssm_deleted and previous_ssm_value is not None:
+            try:
+                await asyncio.to_thread(
+                    _put_openrouter_key_to_ssm,
+                    secret_ref,
+                    previous_ssm_value,
+                )
+            except Exception:
+                logger.exception(
+                    "openrouter_delete_compensation_failed",
+                    extra={"miner_hotkey": payload.miner_hotkey},
+                )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to delete OpenRouter key: {exc}",
+        ) from exc
+    return await _signed_miner_response(
+        request,
+        db,
+        _req.sig.signer_ss58,
+        DeleteOpenRouterApiKeyResponse(ok=True),
+    )

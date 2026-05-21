@@ -139,6 +139,10 @@ class Settings(BaseSettings):
         default=600.0,
         alias="VALIDATOR_OPENROUTER_ERROR_COOLDOWN_SECONDS",
     )
+    openrouter_ssm_prefix: str = Field(
+        default="/s114/dev",
+        alias="OPENROUTER_SSM_PREFIX",
+    )
 
     # Materialized view refresh
     # Fast views: mv_miner_status, mv_miner_screener_stats, mv_miner_competition_stats
