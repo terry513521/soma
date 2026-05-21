@@ -33,6 +33,7 @@ class NginxProxyHandle:
     container_name: str
     proxy_base_url: str
     upstream_base_url: str
+    private_network_name: str
 
 
 PLUGIN_VENV_DIRNAME = ".soma-openclaw-venv"
@@ -79,8 +80,52 @@ def _docker_container_running(name: str) -> bool:
     return result.returncode == 0 and (result.stdout or "").strip().lower() == "true"
 
 
+def _docker_network_exists(name: str) -> bool:
+    result = _run_command(["docker", "network", "inspect", name])
+    return result.returncode == 0
+
+
+def _ensure_docker_network(name: str, *, internal: bool) -> None:
+    if _docker_network_exists(name):
+        return
+    args = ["docker", "network", "create"]
+    if internal:
+        args.append("--internal")
+    args.append(name)
+    result = _run_command(args)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Failed to create Docker network {name!r}: {(result.stderr or result.stdout or '').strip()}"
+        )
+
+
+def _docker_connect_network(name: str, container_name: str, *, alias: str | None = None) -> None:
+    args = ["docker", "network", "connect"]
+    if alias:
+        args.extend(["--alias", alias])
+    args.extend([name, container_name])
+    result = _run_command(args)
+    if result.returncode == 0:
+        return
+    message = (result.stderr or result.stdout or "").strip().lower()
+    if "already exists" in message or "already connected" in message or "endpoint with name" in message:
+        return
+    raise RuntimeError(
+        f"Failed to connect container {container_name!r} to Docker network {name!r}: "
+        f"{(result.stderr or result.stdout or '').strip()}"
+    )
+
+
+def _docker_remove_network(name: str) -> None:
+    _run_command(["docker", "network", "rm", name])
+
+
 def _build_proxy_container_name() -> str:
     return "soma-compact-bench-nginx"
+
+
+def _resolve_private_network_name() -> str:
+    return os.getenv("COMPACT_BENCH_PRIVATE_NETWORK_NAME", "soma-compact-bench-private").strip() or "soma-compact-bench-private"
 
 
 def _normalize_proxy_upstream_base_url(value: str) -> str:
@@ -195,7 +240,9 @@ class CompactBenchExecutor:
         env = os.environ.copy()
         llm_base_url = os.getenv("COMPACT_BENCH_LLM_BASE_URL", "").strip()
         if llm_base_url:
-            env["LLM_BASE_URL"] = self._ensure_llm_proxy(llm_base_url).proxy_base_url
+            proxy_handle = self._ensure_llm_proxy(llm_base_url)
+            env["LLM_BASE_URL"] = proxy_handle.proxy_base_url
+            env["SOMA_OPENCLAW_PRIVATE_NETWORK_NAME"] = proxy_handle.private_network_name
         env["SOMA_OPENCLAW_SOMARIZER_PLUGIN_PATH"] = str(plugin_path)
 
         effective_timeout = task.openclaw_timeout if task.openclaw_timeout is not None else timeout_per_task
@@ -327,19 +374,24 @@ class CompactBenchExecutor:
 
     def _ensure_llm_proxy(self, upstream_base_url: str) -> NginxProxyHandle:
         normalized_upstream_base_url = _normalize_proxy_upstream_base_url(upstream_base_url)
+        private_network_name = _resolve_private_network_name()
         with self._llm_proxy_lock:
             if (
                 self._llm_proxy_handle is not None
                 and self._llm_proxy_handle.upstream_base_url == normalized_upstream_base_url
+                and self._llm_proxy_handle.private_network_name == private_network_name
                 and _docker_container_running(self._llm_proxy_handle.container_name)
             ):
                 return self._llm_proxy_handle
 
-            handle = self._start_llm_proxy(upstream_base_url=normalized_upstream_base_url)
+            handle = self._start_llm_proxy(
+                upstream_base_url=normalized_upstream_base_url,
+                private_network_name=private_network_name,
+            )
             self._llm_proxy_handle = handle
             return handle
 
-    def _start_llm_proxy(self, *, upstream_base_url: str) -> NginxProxyHandle:
+    def _start_llm_proxy(self, *, upstream_base_url: str, private_network_name: str) -> NginxProxyHandle:
         proxy_port = self._get_llm_proxy_port()
         container_name = _build_proxy_container_name()
         config_path = self._output_root / "llm-proxy.nginx.conf"
@@ -353,8 +405,14 @@ class CompactBenchExecutor:
         )
 
         self._stop_llm_proxy(
-            NginxProxyHandle(container_name=container_name, proxy_base_url="", upstream_base_url="")
+            NginxProxyHandle(
+                container_name=container_name,
+                proxy_base_url="",
+                upstream_base_url="",
+                private_network_name=private_network_name,
+            )
         )
+        _ensure_docker_network(private_network_name, internal=True)
 
         result = _run_command(
             [
@@ -374,28 +432,24 @@ class CompactBenchExecutor:
         if result.returncode != 0:
             message = (result.stderr or result.stdout or "").strip()
             raise RuntimeError(f"Failed to start compact-bench nginx proxy container: {message}")
-
-        inspect_result = _run_command(
-            [
-                "docker",
-                "inspect",
-                "-f",
-                "{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
-                container_name,
-            ]
-        )
-        proxy_ip = (inspect_result.stdout or "").strip()
-        if inspect_result.returncode != 0 or not proxy_ip:
+        try:
+            _docker_connect_network(private_network_name, container_name, alias=container_name)
+        except Exception:
             self._stop_llm_proxy(
-                NginxProxyHandle(container_name=container_name, proxy_base_url="", upstream_base_url="")
+                NginxProxyHandle(
+                    container_name=container_name,
+                    proxy_base_url="",
+                    upstream_base_url="",
+                    private_network_name=private_network_name,
+                )
             )
-            message = (inspect_result.stderr or inspect_result.stdout or "").strip()
-            raise RuntimeError(f"Failed to resolve compact-bench nginx proxy IP: {message}")
+            raise
 
         return NginxProxyHandle(
             container_name=container_name,
-            proxy_base_url=f"http://{proxy_ip}:{proxy_port}",
+            proxy_base_url=f"http://{container_name}:{proxy_port}",
             upstream_base_url=upstream_base_url,
+            private_network_name=private_network_name,
         )
 
     def _stop_llm_proxy(self, handle: NginxProxyHandle) -> None:
@@ -474,4 +528,5 @@ class CompactBenchExecutor:
         with self._llm_proxy_lock:
             if self._llm_proxy_handle is not None:
                 self._stop_llm_proxy(self._llm_proxy_handle)
+                _docker_remove_network(self._llm_proxy_handle.private_network_name)
                 self._llm_proxy_handle = None
