@@ -32,15 +32,10 @@ class Evaluator:
             int(getattr(self.settings, "max_concurrent_evaluations", 1)),
         )
         self._evaluation_sem = asyncio.Semaphore(max_concurrent_evaluations)
-        self._batch_scoring_concurrency = max(
-            1, max_concurrent_evaluations
-        )
 
         logging.info(
-            "Evaluator initialized for SWE-Bench scoring: "
-            "max_concurrent_evaluations=%s batch_scoring_concurrency=%s",
+            "Evaluator initialized for SWE-Bench scoring: max_concurrent_evaluations=%s",
             max_concurrent_evaluations,
-            self._batch_scoring_concurrency,
         )
 
     async def close(self) -> None:
@@ -61,125 +56,84 @@ class Evaluator:
             image_name=image_name,
         )
 
-    async def _evaluate_single_challenge(
+    async def _evaluate_task(
         self,
         *,
-        index: int,
-        challenge,
-        challenge_sem: asyncio.Semaphore,
-    ) -> tuple[list[QuestionScore], dict[str, object]]:
-        async with challenge_sem:
-            try:
-                challenge_id = self._require_identifier(
-                    challenge,
-                    aliases=("validation_id",),
-                )
-                challenge_questions = getattr(challenge, "challenge_questions", None)
-                if challenge_questions is None:
-                    question_ids = [challenge_id]
-                else:
-                    if not isinstance(challenge_questions, list):
-                        raise ValueError("challenge.challenge_questions must be a list")
-                    question_ids = []
-                    for qa in challenge_questions:
-                        question_id = getattr(qa, "question_id", None)
-                        if not isinstance(question_id, str) or not question_id.strip():
-                            raise ValueError("challenge question is missing question_id")
-                        question_ids.append(question_id)
-                    if not question_ids:
-                        question_ids = [challenge_id]
+        task: SweBenchValidationTask,
+    ) -> tuple[str, QuestionScore, dict[str, object]]:
+        try:
+            validation_id = self._require_identifier(
+                task,
+                aliases=("validation_id",),
+            )
+            instance_id = self._require_non_empty_str(
+                task,
+                aliases=("instance_id",),
+            )
+            diff = self._require_non_empty_text(
+                task,
+                aliases=("diff",),
+            )
+            arch = self._get_optional_str(
+                task,
+                aliases=("arch",),
+            )
 
-                instance_id = self._require_non_empty_str(
-                    challenge,
-                    aliases=("instance_id",),
-                )
-                diff = self._require_non_empty_text(
-                    challenge,
-                    aliases=("diff",),
-                )
-                arch = self._get_optional_str(
-                    challenge,
-                    aliases=("arch",),
-                )
+            result = await self.evaluate_swebench_patch(
+                instance_id=instance_id,
+                diff=diff,
+                arch=arch,
+            )
 
-                result = await self.evaluate_swebench_patch(
-                    instance_id=instance_id,
-                    diff=diff,
-                    arch=arch,
-                )
-
-                produced_answer = str(int(result.resolved))
-                details = {
+            question_score = QuestionScore(
+                batch_challenge_id=validation_id,
+                question_id=validation_id,
+                produced_answer=str(int(result.resolved)),
+                score=float(result.score),
+                details={
                     "image_name": result.image_name,
                     "binary_resolved": int(result.resolved),
-                }
-
-                challenge_scores: list[QuestionScore] = []
-                for question_id in question_ids:
-                    challenge_scores.append(
-                        QuestionScore(
-                            batch_challenge_id=challenge_id,
-                            question_id=question_id,
-                            produced_answer=produced_answer,
-                            score=float(result.score),
-                            details=details,
-                        )
-                    )
-                return challenge_scores, {
-                    "resolved": bool(result.resolved),
-                    "logs": self._format_logs(result),
-                }
-            except Exception as exc:
-                logging.error(f"Scoring failed for task index={index}: {exc}", exc_info=True)
-                raise BatchScoringError(
-                    error_code="validator_scoring_failed",
-                    message=f"Scoring failed at task index={index}: {exc}",
-                    retryable=True,
-                    details={
-                        "task_index": index,
-                        "validation_id": getattr(challenge, "validation_id", None),
-                        "error": str(exc),
-                    },
-                ) from exc
-
-    async def evaluate(self, tasks: SweBenchValidationTask) -> dict:
-        async with self._evaluation_sem:
-            try:
-                if tasks is None:
-                    raise ValueError("tasks is required")
-                batch_id = self._require_identifier(tasks, aliases=("validation_id",))
-                tasks_list = [tasks]
-                
-                logging.info(f"[Evaluator] ========== RECEIVED {len(tasks_list)} CHALLENGES ==========")
-            except Exception as exc:
-                raise exc
-
-            question_scores: list[QuestionScore] = []
-            single_task_summary: dict[str, object] | None = None
-            challenge_sem = asyncio.Semaphore(self._batch_scoring_concurrency)
-            scored_per_challenge = await asyncio.gather(
-                *(
-                    self._evaluate_single_challenge(
-                        index=index,
-                        challenge=challenge,
-                        challenge_sem=challenge_sem,
-                    )
-                    for index, challenge in enumerate(tasks_list)
-                )
+                },
             )
-            for challenge_scores, challenge_summary in scored_per_challenge:
-                question_scores.extend(challenge_scores)
-                if single_task_summary is None:
-                    single_task_summary = challenge_summary
-            
-            logging.info(f"[Evaluator] Generated {len(question_scores)} question scores")
+            return validation_id, question_score, {
+                "resolved": bool(result.resolved),
+                "logs": self._format_logs(result),
+            }
+        except Exception as exc:
+            logging.error(
+                "Scoring failed for validation_id=%s: %s",
+                getattr(task, "validation_id", None),
+                exc,
+                exc_info=True,
+            )
+            raise BatchScoringError(
+                error_code="validator_scoring_failed",
+                message=f"Scoring failed for validation_id={getattr(task, 'validation_id', None)}: {exc}",
+                retryable=True,
+                details={
+                    "validation_id": getattr(task, "validation_id", None),
+                    "error": str(exc),
+                },
+            ) from exc
+
+    async def evaluate(self, task: SweBenchValidationTask) -> dict:
+        async with self._evaluation_sem:
+            if task is None:
+                raise ValueError("task is required")
+
+            logging.info("[Evaluator] Received SWE-Bench validation task")
+
+            batch_id, question_score, task_summary = await self._evaluate_task(
+                task=task,
+            )
+
+            logging.info("[Evaluator] Generated 1 question score")
 
             result = {
-                "question_scores": question_scores,
+                "question_scores": [question_score],
                 "batch_id": batch_id,
             }
-            if len(tasks_list) == 1 and single_task_summary is not None:
-                result.update(single_task_summary)
+            result.update(task_summary)
             return result
 
     def has_eval_capacity(self) -> bool:
