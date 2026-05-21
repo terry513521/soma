@@ -43,12 +43,13 @@ from app.services.challenge_factory import (
     create_challenge_batch,
     get_qa_pairs_for_challenge,
 )
-from app.services.sandbox.remote_sandbox_manager import (
-    RemoteSandboxManager,
+from app.services.sandbox.base import (
     SandboxExecutionError,
 )
+from app.services.sandbox.remote_compact_bench_manager import RemoteCompactBenchManager
 from app.services.blob.s3 import S3BlobStorage
-from app.services.blob.compressed_text_storage import CompressedTextStorage
+from app.services.blob.patch_artifact_storage import PatchArtifactStorage
+from app.services.blob.text_artifact_storage import TextArtifactStorage
 from soma_shared.utils.signer import generate_nonce, sign_payload_model
 from soma_shared.utils.verifier import verify_validator_stake_dep
 from app.api.deps import verify_request_dep_tz
@@ -183,23 +184,30 @@ def _get_s3_storage(request: Request) -> S3BlobStorage:
     return s3_storage
 
 
-def _get_sandbox_manager(request: Request) -> RemoteSandboxManager:
-    """Get or create remote sandbox manager instance."""
+def _get_output_storage(request: Request) -> TextArtifactStorage:
+    """Get or create the artifact storage for compact-bench outputs."""
+    storage_attr = "compact_bench_output_storage"
+    output_storage = getattr(request.app.state, storage_attr, None)
+    if output_storage is None:
+        s3_storage = _get_s3_storage(request)
+        output_storage = PatchArtifactStorage(s3_storage)
+        setattr(request.app.state, storage_attr, output_storage)
+    return output_storage
+
+
+def _get_compact_bench_manager(request: Request) -> RemoteCompactBenchManager:
+    """Get or create the compact-bench sandbox manager instance."""
     sandbox_manager = getattr(request.app.state, "sandbox_manager", None)
     if sandbox_manager is None:
-        if not settings.sandbox_service_url:
+        service_url = settings.compact_bench_service_url or settings.sandbox_service_url
+        if not service_url:
             raise RuntimeError(
-                "SANDBOX_SERVICE_URL must be set in configuration"
+                "COMPACT_BENCH_SERVICE_URL or SANDBOX_SERVICE_URL must be set in configuration"
             )
-        s3_storage = _get_s3_storage(request)
-        compressed_text_storage = CompressedTextStorage(s3_storage)
-
-        sandbox_manager = RemoteSandboxManager(
-            sandbox_service_url=settings.sandbox_service_url,
-            compressed_text_storage=compressed_text_storage,
-            timeout_per_task=settings.sandbox_timeout_per_task_seconds,
-            container_timeout_offset=settings.sandbox_container_timeout_offset,
-            request_timeout_offset=settings.sandbox_request_timeout_offset,
+        sandbox_manager = RemoteCompactBenchManager(
+            sandbox_service_url=service_url,
+            execution_timeout_seconds=settings.sandbox_timeout_per_task_seconds,
+            submission_timeout_seconds=settings.sandbox_submission_timeout_seconds,
         )
         request.app.state.sandbox_manager = sandbox_manager
     return sandbox_manager
@@ -716,31 +724,29 @@ async def request_challenge(
 
     try:
         script_s3_key = get_script_s3_key(miner.ss58, script)
-        sandbox_manager = _get_sandbox_manager(request)
+        sandbox_manager = _get_compact_bench_manager(request)
+        output_storage = _get_output_storage(request)
         s3_storage = _get_s3_storage(request)
 
-        # Compute expiry long enough to cover sandbox execution + network overhead.
-        _presigned_expires_in = int(
-            settings.sandbox_timeout_per_task_seconds * len(challenge_texts)
-            + settings.sandbox_container_timeout_offset
-            + settings.sandbox_request_timeout_offset
-        ) + 60  # 60 s buffer
+        # The request returns immediately; presigned URLs only need to outlive sandbox execution.
+        _presigned_expires_in = int(settings.sandbox_timeout_per_task_seconds) + 300
 
         script_presigned_url: str = await s3_storage.generate_presigned_url(
             script_s3_key, "get_object", expires_in=_presigned_expires_in
         )
-        storage_keys = [f"compressed-texts/{su}.json" for su in storage_uuids]
+        storage_keys = [output_storage.build_key(storage_uuid) for storage_uuid in storage_uuids]
         storage_presigned_urls: list[str] = await s3_storage.generate_presigned_url(
             storage_keys, "put_object", expires_in=_presigned_expires_in
         )
 
-        compressed_texts, task_errors, execution_times = await sandbox_manager.run_batch(
-            batch_id=str(challenge_batch.id),
-            script_presigned_url=script_presigned_url,
-            challenge_texts=challenge_texts,
-            compression_ratios=compression_ratios,
-            storage_uuids=storage_uuids,
-            storage_presigned_urls=storage_presigned_urls,
+        if len(response_items) != 1:
+            raise SandboxExecutionError(
+                "Compact-bench validator flow requires exactly one challenge instance per request."
+            )
+
+        raise SandboxExecutionError(
+            "Compact-bench validator flow requires benchmark and instance_id task metadata and is not wired "
+            "through the generic challenge batch path."
         )
         failed_task_count = sum(1 for e in task_errors if e)
         if failed_task_count:
