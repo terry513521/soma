@@ -41,7 +41,7 @@ class RemoteCompactBenchManager:
         *,
         batch_id: str,
         storage_uuid: str,
-        storage_presigned_url: str,
+        script_presigned_url: str,
         challenge_text: str,
         task_context: dict[str, Any],
     ) -> SandboxTaskResult:
@@ -50,7 +50,7 @@ class RemoteCompactBenchManager:
             run_id=run_id,
             task_context=task_context,
             storage_uuid=storage_uuid,
-            storage_presigned_url=storage_presigned_url,
+            script_presigned_url=script_presigned_url,
             challenge_text=challenge_text,
         )
 
@@ -98,7 +98,7 @@ class RemoteCompactBenchManager:
         run_id: int,
         task_context: dict[str, Any],
         storage_uuid: str,
-        storage_presigned_url: str,
+        script_presigned_url: str,
         challenge_text: str,
     ) -> CompactBenchRunTaskRequest:
         benchmark = str(task_context.get("benchmark") or "").strip()
@@ -134,7 +134,7 @@ class RemoteCompactBenchManager:
             benchmark=benchmark,
             instance_id=instance_id,
             run_id=run_id,
-            storage_presigned_url=storage_presigned_url,
+            script_presigned_url=script_presigned_url,
             agent_name=str(task_context.get("agent_name") or "openclaw").strip() or "openclaw",
             model=str(task_context.get("model")).strip() if task_context.get("model") else None,
             openclaw_timeout=(

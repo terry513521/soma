@@ -52,6 +52,14 @@ async def startup():
     logger.info("Sandbox semaphore initialized with max_concurrent=%d", max_concurrent)
 
 
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    """Release persistent compact-bench helper resources."""
+    executor = getattr(app.state, "compact_bench_executor", None)
+    if executor is not None:
+        executor.shutdown()
+
+
 def get_compact_bench_executor() -> CompactBenchExecutor:
     """Get or create compact-bench executor instance."""
     if not hasattr(app.state, "compact_bench_executor"):
@@ -118,33 +126,7 @@ async def _execute_compact_bench_task_in_background(request: CompactBenchRunTask
             timeout_per_task=request.openclaw_timeout,
         )
 
-        patch_capture_status = False
-        report_error = output.report.error
-        if output.patch_text.strip():
-            try:
-                async with httpx.AsyncClient() as http_client:
-                    put_resp = await http_client.put(
-                        request.storage_presigned_url,
-                        content=output.patch_text.encode("utf-8"),
-                    )
-                    put_resp.raise_for_status()
-                patch_capture_status = True
-            except Exception as exc:
-                report_error = (
-                    f"{report_error}; patch upload failed: {exc}"
-                    if report_error
-                    else f"patch upload failed: {exc}"
-                )
-        else:
-            patch_capture_status = output.report.ok_status
-
-        report = output.report.model_copy(
-            update={
-                "error": report_error,
-                "patch_capture_status": patch_capture_status,
-            }
-        )
-        await _send_compact_bench_report(report)
+        await _send_compact_bench_report(output.report)
     except Exception as exc:
         tb = traceback.format_exc()
         logger.error(
