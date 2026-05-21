@@ -29,6 +29,13 @@ from soma_shared.contracts.api.v1.frontend import (
     PartialScore,
     QuestionDetail,
     SourceCodeSummary,
+    SweMinerSummary,
+    SweMinerSummaryResponse,
+    SweMinerTaskDetailResponse,
+    SweMinerTaskResultItem,
+    SweMinerTaskResultsResponse,
+    SweMinerTaskRunsResponse,
+    SweMinersListResponse,
     ValidatorListItem,
     ValidatorsListResponse,
 )
@@ -377,6 +384,13 @@ class FrontendMetricsRoute(APIRoute):
             return response
 
         return custom_route_handler
+
+
+def _swe_frontend_not_ready() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail="SWE frontend endpoints are not available yet",
+    )
 
 
 frontend_router = APIRouter(
@@ -1408,6 +1422,74 @@ async def list_validators(
     )
 
     return response
+
+
+@frontend_router.get(
+    "/swe/miners/{comp_id}",
+    response_model=SweMinersListResponse,
+)
+async def list_swe_miners_by_competition(
+    comp_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db_session),
+    page: int = Query(default=1, ge=1),
+    limit: int = Query(default=20, ge=1, le=400),
+) -> SweMinersListResponse:
+    raise _swe_frontend_not_ready()
+
+
+@frontend_router.get(
+    "/swe/miners/{comp_id}/{hotkey}",
+    response_model=SweMinerSummaryResponse,
+)
+async def get_swe_miner_by_competition(
+    comp_id: int,
+    hotkey: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db_session),
+) -> SweMinerSummaryResponse:
+    raise _swe_frontend_not_ready()
+
+
+@frontend_router.get(
+    "/swe/miners/{comp_id}/{hotkey}/tasks",
+    response_model=SweMinerTaskResultsResponse,
+)
+async def get_swe_miner_task_results(
+    comp_id: int,
+    hotkey: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db_session),
+) -> SweMinerTaskResultsResponse:
+    raise _swe_frontend_not_ready()
+
+
+@frontend_router.get(
+    "/swe/miners/{comp_id}/{hotkey}/tasks/{task_name}",
+    response_model=SweMinerTaskDetailResponse,
+)
+async def get_swe_miner_task_result(
+    comp_id: int,
+    hotkey: str,
+    task_name: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db_session),
+) -> SweMinerTaskDetailResponse:
+    raise _swe_frontend_not_ready()
+
+
+@frontend_router.get(
+    "/swe/miners/{comp_id}/{hotkey}/tasks/{task_name}/runs",
+    response_model=SweMinerTaskRunsResponse,
+)
+async def get_swe_miner_task_runs(
+    comp_id: int,
+    hotkey: str,
+    task_name: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db_session),
+) -> SweMinerTaskRunsResponse:
+    raise _swe_frontend_not_ready()
 
 
 router = APIRouter(
