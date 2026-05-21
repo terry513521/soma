@@ -5,7 +5,7 @@ import json
 import sqlalchemy as sa
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from math import ceil
+from math import ceil, log
 
 from aiocache import Cache
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -338,11 +338,13 @@ async def _get_is_partial_winner(db: AsyncSession, comp_id: int) -> bool:
 def _trim_token_ratio(tokens_without_compression: int | None, tokens_with_compression: int | None) -> float:
     if tokens_without_compression is None or tokens_with_compression is None:
         return 0.0
+    if tokens_without_compression <= 0:
+        return 0.0
     if tokens_with_compression <= 0:
         return 0.0
 
     ratio = float(tokens_without_compression) / float(tokens_with_compression)
-    return max(-2.0, min(2.0, ratio))
+    return max(-2.0, min(2.0, log(ratio)))
 
 
 def _base_swe_score(pass_without_compression: bool | None, pass_with_compression: bool | None) -> tuple[float, float]:
@@ -528,9 +530,7 @@ def _build_swe_task_result_item(group: dict[str, object]) -> SweMinerTaskResultI
         task_name=str(group["task_name"]),
         is_screener=bool(group["is_screener"]),
         pass_without_compression=group["baseline_resolved"],
-        pass_with_compression=(
-            any(bool(run["pass_with_compression"]) for run in runs) if runs else None
-        ),
+        pass_with_compression=(runs[0]["pass_with_compression"] if len(runs) == 1 else None),
         tokens_without_compression=_to_optional_int(group["baseline_tokens_used"]),
         tokens_with_compression=(
             sum(compressed_tokens) / len(compressed_tokens) if compressed_tokens else None
@@ -538,6 +538,23 @@ def _build_swe_task_result_item(group: dict[str, object]) -> SweMinerTaskResultI
         platform_score=(sum(run_scores) / len(run_scores) if run_scores else None),
         run_count=len(runs),
     )
+
+
+def _build_swe_miner_scores(task_groups: dict[str, dict[str, object]]) -> tuple[float | None, float | None]:
+    total_run_scores: list[float] = []
+    screener_run_scores: list[float] = []
+
+    for group in task_groups.values():
+        target_scores = screener_run_scores if bool(group["is_screener"]) else total_run_scores
+        target_scores.extend(float(run["platform_score"]) for run in group["runs"])
+
+    total_score = sum(total_run_scores) / len(total_run_scores) if total_run_scores else None
+    screener_score = (
+        sum(screener_run_scores) / len(screener_run_scores)
+        if screener_run_scores
+        else None
+    )
+    return total_score, screener_score
 
 
 async def _log_frontend_request_metrics(request: Request, status_code: int) -> None:
@@ -1675,13 +1692,11 @@ async def list_swe_miners_by_competition(
     grouped: dict[str, dict[str, object]] = {}
     for hotkey, task_rows in miner_rows.items():
         task_groups = _build_swe_task_groups(task_rows)
-        task_items = [_build_swe_task_result_item(group) for group in task_groups.values()]
-        total_scores = [item.platform_score for item in task_items if item.platform_score is not None and not item.is_screener]
-        screener_scores = [item.platform_score for item in task_items if item.platform_score is not None and item.is_screener]
+        total_score, screener_score = _build_swe_miner_scores(task_groups)
         grouped[hotkey] = {
             "hotkey": hotkey,
-            "total_score": (sum(total_scores) / len(total_scores) if total_scores else None),
-            "screener_score": (sum(screener_scores) / len(screener_scores) if screener_scores else None),
+            "total_score": total_score,
+            "screener_score": screener_score,
         }
 
     sorted_miners = sorted(
@@ -1737,14 +1752,13 @@ async def get_swe_miner_by_competition(
 
     task_groups = _build_swe_task_groups(rows)
     task_items = [_build_swe_task_result_item(group) for group in task_groups.values()]
-    total_scores = [item.platform_score for item in task_items if item.platform_score is not None and not item.is_screener]
-    screener_scores = [item.platform_score for item in task_items if item.platform_score is not None and item.is_screener]
+    total_score, screener_score = _build_swe_miner_scores(task_groups)
 
     return SweMinerSummaryResponse(
         miner=SweMinerSummary(
             hotkey=hotkey,
-            total_score=(sum(total_scores) / len(total_scores) if total_scores else None),
-            screener_score=(sum(screener_scores) / len(screener_scores) if screener_scores else None),
+            total_score=total_score,
+            screener_score=screener_score,
             task_count=len(task_items),
             screener_task_count=sum(1 for item in task_items if item.is_screener),
         )
