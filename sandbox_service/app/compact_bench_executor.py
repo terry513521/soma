@@ -87,6 +87,9 @@ class CompactBenchExecutor:
 
         command = self._build_command(task=task, output_dir=output_dir)
         env = os.environ.copy()
+        llm_base_url = os.getenv("COMPACT_BENCH_LLM_BASE_URL", "").strip()
+        if llm_base_url:
+            env["LLM_BASE_URL"] = llm_base_url
 
         effective_timeout = task.openclaw_timeout if task.openclaw_timeout is not None else timeout_per_task
         timeout = max(1.0, float(effective_timeout)) if effective_timeout is not None else None
