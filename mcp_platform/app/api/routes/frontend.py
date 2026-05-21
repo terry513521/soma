@@ -37,6 +37,7 @@ from soma_shared.contracts.api.v1.frontend import (
     SweMinerTaskDetailResponse,
     SweMinerTaskResultItem,
     SweMinerTaskResultsResponse,
+    SweMinerTaskRunItem,
     SweMinerTaskRunsResponse,
     SweMinersListResponse,
     ValidatorListItem,

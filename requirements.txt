@@ -5,6 +5,7 @@ aiohappyeyeballs==2.6.1
 aiohttp==3.10.11
 aioitertools==0.13.0
 aiosignal==1.4.0
+aiocache==0.12.3
 aiosqlite==0.22.1
 annotated-doc==0.0.4
 annotated-types==0.7.0
