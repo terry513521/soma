@@ -5,12 +5,12 @@ import logging
 import os
 from typing import AsyncIterator
 
-import boto3
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from gateway.services.ssm.client import get_ssm_client
 
 
 logger = logging.getLogger("soma.gateway")
@@ -52,14 +52,6 @@ async def shutdown() -> None:
         await engine.dispose()
 
 
-def _ssm_client():
-    region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION")
-    kwargs: dict[str, str] = {}
-    if region:
-        kwargs["region_name"] = region
-    return boto3.client("ssm", **kwargs)
-
-
 def _resolve_ssm_parameter_name(api_key_path: str) -> str:
     prefix = os.getenv("OPENROUTER_SSM_PREFIX", "/s114/dev")
     clean_prefix = prefix.rstrip("/")
@@ -71,7 +63,7 @@ def _resolve_ssm_parameter_name(api_key_path: str) -> str:
 
 def _resolve_api_key_from_ssm(api_key_path: str) -> str:
     parameter_name = _resolve_ssm_parameter_name(api_key_path)
-    client = _ssm_client()
+    client = get_ssm_client()
     resp = client.get_parameter(Name=parameter_name, WithDecryption=True)
     value = (resp.get("Parameter") or {}).get("Value")
     if not isinstance(value, str) or not value.strip():
