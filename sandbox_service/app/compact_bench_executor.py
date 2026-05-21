@@ -39,6 +39,20 @@ def _token_count(value: Any) -> int | None:
         return int(value)
     return None
 
+
+def _step_count(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float) and value >= 0 and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.isdigit():
+            return int(stripped)
+    return None
+
 class CompactBenchExecutor:
     """Runs compact-bench solve commands and captures produced patches."""
 
@@ -104,6 +118,7 @@ class CompactBenchExecutor:
                 error=str(exc),
                 execution_time_seconds=duration,
                 total_tokens=None,
+                agent_steps=None,
                 patch_capture_status=False,
                 patch_diff=None,
                 metadata=metadata,
@@ -124,7 +139,10 @@ class CompactBenchExecutor:
         status = str(row.get("status") or ("completed" if process.returncode == 0 else "runtime-error"))
         error_text = str(row.get("error") or "").strip() or process.stderr.strip() or None
         success = process.returncode == 0 and status == "completed"
-        total_tokens = self._extract_total_tokens(row=row, metadata=row_metadata)
+        total_tokens, agent_steps = self._extract_execution_metrics(
+            row=row,
+            metadata=row_metadata,
+        )
         metadata = dict(task.metadata)
         metadata.update(row_metadata)
         metadata.update(
@@ -145,6 +163,7 @@ class CompactBenchExecutor:
             error=error_text,
             execution_time_seconds=duration,
             total_tokens=total_tokens,
+            agent_steps=agent_steps,
             patch_capture_status=False,
             patch_diff=patch_text or None,
             metadata=metadata,
@@ -191,7 +210,13 @@ class CompactBenchExecutor:
                 return payload
         return {}
 
-    def _extract_total_tokens(self, *, row: dict[str, Any], metadata: dict[str, Any]) -> int | None:
+    def _extract_execution_metrics(
+        self,
+        *,
+        row: dict[str, Any],
+        metadata: dict[str, Any],
+    ) -> tuple[int | None, int | None]:
+        total_tokens = None
         for candidate in (
             row.get("total_tokens"),
             metadata.get("total_tokens"),
@@ -200,15 +225,30 @@ class CompactBenchExecutor:
         ):
             value = _token_count(candidate)
             if value is not None:
-                return value
+                total_tokens = value
+                break
 
-        token_usage = metadata.get("token_usage")
-        if isinstance(token_usage, dict):
-            total_payload = token_usage.get("total")
-            if isinstance(total_payload, dict):
-                return _token_count(total_payload.get("total_tokens"))
+        if total_tokens is None:
+            token_usage = metadata.get("token_usage")
+            if isinstance(token_usage, dict):
+                total_payload = token_usage.get("total")
+                if isinstance(total_payload, dict):
+                    total_tokens = _token_count(total_payload.get("total_tokens"))
 
-        return None
+        agent_steps = None
+        for candidate in (
+            row.get("agent_steps"),
+            metadata.get("agent_steps"),
+            row.get("steps"),
+            metadata.get("steps"),
+            (metadata.get("agent") or {}).get("steps") if isinstance(metadata.get("agent"), dict) else None,
+        ):
+            value = _step_count(candidate)
+            if value is not None:
+                agent_steps = value
+                break
+
+        return total_tokens, agent_steps
 
     def shutdown(self) -> None:
         """Compact-bench executor does not hold persistent resources."""

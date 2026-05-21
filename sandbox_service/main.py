@@ -159,6 +159,7 @@ async def _execute_compact_bench_task_in_background(request: CompactBenchRunTask
             error=f"{type(exc).__name__}: {exc}",
             execution_time_seconds=None,
             total_tokens=None,
+            agent_steps=None,
             patch_capture_status=False,
             patch_diff=None,
             metadata={

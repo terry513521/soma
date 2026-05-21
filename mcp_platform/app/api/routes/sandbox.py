@@ -44,8 +44,7 @@ async def _persist_compact_bench_report(
         )
         return False
 
-    # TODO: pass the real agent step count in the callback contract.
-    run.agent_steps = 0
+    run.agent_steps = payload.agent_steps
     # TODO: replace this with the S3 path/UUID in the callback contract instead of full patch payload.
     if payload.patch_diff:
         run.diff_storage_uuid = payload.patch_diff
