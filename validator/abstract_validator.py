@@ -69,7 +69,7 @@ class AbstractValidator(ABC):
         return NotImplementedError
 
     @abstractmethod
-    def get_tasks_for_eval(self) -> SweBenchValidationTask | None:
+    async def get_tasks_for_eval(self) -> SweBenchValidationTask | None:
         """
         Fetch tasks to be evaluated from the platform.
         Calls an PLATFORM_URL/api/v1/validator/get_swebench_validation endpoint.
@@ -78,7 +78,7 @@ class AbstractValidator(ABC):
         return NotImplementedError
 
     @abstractmethod
-    def report_results(self, task: Any, results: Any) -> None:
+    async def report_results(self, task: Any, results: Any) -> None:
         """
         Send results back to the platform.
         Calls an PLATFORM_URL/api/v1/validator/submit_swebench_validation_score endpoint.
