@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-import os
-
+import json
 import logging
 
-from .abstract_evaluator import AbstractEvaluator
-from .llm_scorer import Scoring, LLMInsufficientFundsError
-from soma_shared.contracts.validator.v1.messages import GetChallengesResponse, QuestionScore
+from .swebench_evaluator import SWEBenchContainerEvaluator, SWEBenchEvaluationResult
+from soma_shared.contracts.validator.v1.messages import QuestionScore, SweBenchValidationTask
 
 
 class BatchScoringError(RuntimeError):
@@ -25,153 +23,191 @@ class BatchScoringError(RuntimeError):
         self.details = details or {}
 
 
-class Evaluator(AbstractEvaluator):
-    """
-    Base class for evaluators.
-    Evaluators are responsible for evaluating tasks assigned to the validator.
-    """
+class Evaluator:
     def __init__(self, settings=None):
-        super().__init__()
         self.settings = settings
-
-        self._llm_scorer = Scoring(settings=settings)
-        cpu_count = os.cpu_count() or 2
-        self._evaluation_sem = asyncio.Semaphore(self.settings.max_concurrent_evaluations)
-        self._batch_scoring_concurrency = max(
-            1, int(self.settings.max_concurrent_evaluations)
+        self._swebench_evaluator = SWEBenchContainerEvaluator(settings=settings)
+        max_concurrent_evaluations = max(
+            1,
+            int(getattr(self.settings, "max_concurrent_evaluations", 1)),
         )
-        
+        self._evaluation_sem = asyncio.Semaphore(max_concurrent_evaluations)
+
         logging.info(
-            f"Evaluator initialized: max_concurrent_evaluations={self.settings.max_concurrent_evaluations} "
-            f"batch_scoring_concurrency={self._batch_scoring_concurrency} "
-            f"(cpu_count={cpu_count})"
+            "Evaluator initialized for SWE-Bench scoring: max_concurrent_evaluations=%s",
+            max_concurrent_evaluations,
         )
-
-    async def score(self, compressed_text: str, questions: list[str], answers: list[str]):
-        result = await self._llm_scorer.score_async(text=compressed_text, questions=questions, expected_answers=answers)
-        return result
 
     async def close(self) -> None:
-        await self._llm_scorer.close()
+        return None
 
-    async def _evaluate_single_challenge(
+    async def evaluate_swebench_patch(
         self,
         *,
-        index: int,
-        challenge,
-        challenge_sem: asyncio.Semaphore,
-    ) -> list[QuestionScore]:
-        async with challenge_sem:
-            try:
-                compressed_text = getattr(challenge, "compressed_text", None)
-                if compressed_text is None:
-                    raise ValueError("challenge.compressed_text is None")
-                if not isinstance(compressed_text, str):
-                    raise ValueError(
-                        f"challenge.compressed_text must be str, got {type(compressed_text)}"
-                    )
-                if compressed_text.strip() == "":
-                    raise ValueError("challenge.compressed_text is empty or whitespace")
+        instance_id: str,
+        diff: str,
+        arch: str | None = None,
+        image_name: str | None = None,
+    ) -> SWEBenchEvaluationResult:
+        return await self._swebench_evaluator.evaluate_instance_diff(
+            instance_id=instance_id,
+            diff=diff,
+            arch=arch,
+            image_name=image_name,
+        )
 
-                questions = [qa.question for qa in challenge.challenge_questions]
-                answers = [qa.answer for qa in challenge.challenge_questions]
-
-                logging.info(f"[Evaluator]   Questions: {questions}")
-                logging.info(f"[Evaluator]   Expected answers: {answers}")
-
-                scoring_result = await self.score(compressed_text, questions, answers)
-                logging.info(
-                    f"[Evaluator]   Model answers: {scoring_result.model_answers}"
-                )
-                logging.info(f"[Evaluator]   LLM Score: {scoring_result.score}")
-
-                challenge_scores: list[QuestionScore] = []
-                for q_idx, qa in enumerate(challenge.challenge_questions):
-                    model_answer = (
-                        scoring_result.model_answers[q_idx]
-                        if q_idx < len(scoring_result.model_answers)
-                        else ""
-                    )
-                    q_score = (
-                        scoring_result.scores[q_idx]
-                        if q_idx < len(scoring_result.scores)
-                        else 0.0
-                    )
-                    detail = (
-                        scoring_result.details[q_idx]
-                        if q_idx < len(scoring_result.details)
-                        else {}
-                    )
-
-                    challenge_scores.append(
-                        QuestionScore(
-                            batch_challenge_id=challenge.batch_challenge_id,
-                            question_id=qa.question_id,
-                            produced_answer=model_answer,
-                            score=float(q_score),
-                            details=detail if isinstance(detail, dict) else None,
-                        )
-                    )
-                return challenge_scores
-            except Exception as exc:
-                logging.error(f"Scoring failed for task index={index}: {exc}", exc_info=True)
-                if isinstance(exc, LLMInsufficientFundsError):
-                    raise BatchScoringError(
-                        error_code="provider_insufficient_funds",
-                        message="OpenRouter insufficient funds detected during scoring",
-                        retryable=True,
-                        details={
-                            "task_index": index,
-                            "batch_challenge_id": challenge.batch_challenge_id,
-                            "error": str(exc),
-                        },
-                    ) from exc
-                raise BatchScoringError(
-                    error_code="validator_scoring_failed",
-                    message=f"Scoring failed at task index={index}: {exc}",
-                    retryable=True,
-                    details={
-                        "task_index": index,
-                        "batch_challenge_id": challenge.batch_challenge_id,
-                        "error": str(exc),
-                    },
-                ) from exc
-
-    async def evaluate(self, tasks: GetChallengesResponse) -> dict:
-        async with self._evaluation_sem:
-            try:
-                if tasks is None:
-                    raise ValueError("tasks is required")
-                batch_id = getattr(tasks, "batch_id", None)
-                tasks_list = tasks.challenges
-                if not isinstance(tasks_list, list):
-                    raise ValueError("challenges must be a list")
-                
-                logging.info(f"[Evaluator] ========== RECEIVED {len(tasks_list)} CHALLENGES ==========")
-            except Exception as exc:
-                raise exc
-
-            question_scores: list[QuestionScore] = []
-            challenge_sem = asyncio.Semaphore(self._batch_scoring_concurrency)
-            scored_per_challenge = await asyncio.gather(
-                *(
-                    self._evaluate_single_challenge(
-                        index=index,
-                        challenge=challenge,
-                        challenge_sem=challenge_sem,
-                    )
-                    for index, challenge in enumerate(tasks_list)
-                )
+    async def _evaluate_task(
+        self,
+        *,
+        task: SweBenchValidationTask,
+    ) -> tuple[str, QuestionScore, dict[str, object]]:
+        try:
+            validation_id = self._require_identifier(
+                task,
+                aliases=("validation_id",),
             )
-            for challenge_scores in scored_per_challenge:
-                question_scores.extend(challenge_scores)
-            
-            logging.info(f"[Evaluator] Generated {len(question_scores)} question scores")
-            
-            return {
-                "question_scores": question_scores,
+            instance_id = self._require_non_empty_str(
+                task,
+                aliases=("instance_id",),
+            )
+            diff = self._require_non_empty_text(
+                task,
+                aliases=("diff",),
+            )
+            arch = self._get_optional_str(
+                task,
+                aliases=("arch",),
+            )
+
+            result = await self.evaluate_swebench_patch(
+                instance_id=instance_id,
+                diff=diff,
+                arch=arch,
+            )
+
+            question_score = QuestionScore(
+                batch_challenge_id=validation_id,
+                question_id=validation_id,
+                produced_answer=str(int(result.resolved)),
+                score=float(result.score),
+                details={
+                    "image_name": result.image_name,
+                    "binary_resolved": int(result.resolved),
+                },
+            )
+            return validation_id, question_score, {
+                "resolved": bool(result.resolved),
+                "logs": self._format_logs(result),
+            }
+        except Exception as exc:
+            logging.error(
+                "Scoring failed for validation_id=%s: %s",
+                getattr(task, "validation_id", None),
+                exc,
+                exc_info=True,
+            )
+            raise BatchScoringError(
+                error_code="validator_scoring_failed",
+                message=f"Scoring failed for validation_id={getattr(task, 'validation_id', None)}: {exc}",
+                retryable=True,
+                details={
+                    "validation_id": getattr(task, "validation_id", None),
+                    "error": str(exc),
+                },
+            ) from exc
+
+    async def evaluate(self, task: SweBenchValidationTask) -> dict:
+        async with self._evaluation_sem:
+            if task is None:
+                raise ValueError("task is required")
+
+            logging.info("[Evaluator] Received SWE-Bench validation task")
+
+            batch_id, question_score, task_summary = await self._evaluate_task(
+                task=task,
+            )
+
+            logging.info("[Evaluator] Generated 1 question score")
+
+            result = {
+                "question_scores": [question_score],
                 "batch_id": batch_id,
             }
+            result.update(task_summary)
+            return result
 
     def has_eval_capacity(self) -> bool:
         return self._evaluation_sem._value > 0
+
+    @staticmethod
+    def _get_optional_str(challenge, *, aliases: tuple[str, ...]) -> str | None:
+        for alias in aliases:
+            value = getattr(challenge, alias, None)
+            if value is None:
+                continue
+            if not isinstance(value, str):
+                raise ValueError(f"challenge.{alias} must be a string")
+            trimmed = value.strip()
+            if trimmed:
+                return trimmed
+        return None
+
+    def _require_non_empty_str(self, challenge, *, aliases: tuple[str, ...]) -> str:
+        value = self._get_optional_str(challenge, aliases=aliases)
+        if value is None:
+            aliases_str = ", ".join(aliases)
+            raise ValueError(f"challenge is missing required string field: {aliases_str}")
+        return value
+
+    @staticmethod
+    def _require_identifier(challenge, *, aliases: tuple[str, ...]) -> str:
+        for alias in aliases:
+            value = getattr(challenge, alias, None)
+            if value is None:
+                continue
+            if isinstance(value, int):
+                return str(value)
+            if isinstance(value, str):
+                trimmed = value.strip()
+                if trimmed:
+                    return trimmed
+                continue
+            raise ValueError(f"challenge.{alias} must be a string or integer")
+        aliases_str = ", ".join(aliases)
+        raise ValueError(f"challenge is missing required identifier field: {aliases_str}")
+
+    @staticmethod
+    def _require_non_empty_text(challenge, *, aliases: tuple[str, ...]) -> str:
+        for alias in aliases:
+            value = getattr(challenge, alias, None)
+            if value is None:
+                continue
+            if not isinstance(value, str):
+                raise ValueError(f"challenge.{alias} must be a string")
+            if value.strip():
+                return value
+        aliases_str = ", ".join(aliases)
+        raise ValueError(f"challenge is missing required string field: {aliases_str}")
+
+    @staticmethod
+    def _format_logs(result: SWEBenchEvaluationResult) -> str:
+        logs = getattr(result, "logs", None)
+        if isinstance(logs, str):
+            trimmed_logs = logs.strip()
+            if trimmed_logs:
+                return trimmed_logs
+
+        report = getattr(result, "report", None)
+        if report is not None:
+            try:
+                return json.dumps(report, sort_keys=True)
+            except TypeError:
+                logging.debug("Failed to serialize SWE-Bench report to JSON", exc_info=True)
+        instance_id = getattr(result, "instance_id", "unknown")
+        resolved = bool(getattr(result, "resolved", False))
+        image_name = getattr(result, "image_name", "unknown")
+        run_id = getattr(result, "run_id", "unknown")
+        return (
+            f"instance_id={instance_id} resolved={int(resolved)} "
+            f"image_name={image_name} run_id={run_id}"
+        )

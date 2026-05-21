@@ -35,7 +35,7 @@ confection==0.1.5
 cryptography==46.0.3
 cymem==2.0.13
 cytoolz==1.1.0
-decorator==5.2.1
+decorator==4.4.2
 docker==7.1.0
 ecdsa==0.19.1
 eth-hash==0.7.1
@@ -128,5 +128,5 @@ wheel==0.45.1
 wrapt==1.17.3
 xxhash==3.6.0
 yarl==1.22.0
--e ../SOMA-compact-bench
-git+https://github.com/DendriteHQ/SOMA-shared.git@feat/swe-bench
+git+https://github.com/SWE-rebench/SWE-bench-fork.git@main
+git+https://github.com/DendriteHQ/SOMA-shared.git@main

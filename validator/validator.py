@@ -1,4 +1,5 @@
 from __future__ import annotations
+import json
 import sys
 from pathlib import Path
 import os
@@ -14,17 +15,17 @@ import numpy as np
 from fastapi import FastAPI, Depends, HTTPException, Request
 from validator.abstract_validator import AbstractValidator
 from soma_shared.contracts.validator.v1.messages import (
-    GetChallengesRequest,
+    GetSweBenchValidationRequest,
+    GetSweBenchValidationResponse,
     HeartbeatRequest,
     HeartbeatResponse,
-    PostChallengeScores,
-    PostChallengeScoresResponse,
-    ScoreSubmissionType,
+    SubmitSweBenchValidationScoreRequest,
+    SubmitSweBenchValidationScoreResponse,
+    SweBenchValidationTask,
     ValidatorRegisterRequest,
     ValidatorRegisterResponse,
     GetBestMinersUidRequest,
     GetBestMinersUidResponse,
-    GetChallengesResponse,
 )
 from soma_shared.contracts.common.signatures import SignedEnvelope
 import asyncio
@@ -36,7 +37,6 @@ import subprocess
 from soma_shared.utils.signer import sign_payload_model, generate_nonce
 from validator.chain.weigt_setter import WeightSetter
 from validator.evaluation.evaluator import BatchScoringError, Evaluator
-from validator.evaluation.llm_scorer import LLMClient, LLMInsufficientFundsError
 from soma_shared.utils.verifier import verify_httpx_response
 import bittensor as bt
 
@@ -57,7 +57,6 @@ class Validator(AbstractValidator):
     def __init__(self):
         super().__init__()
         self.settings = self.init_settings()
-        self.verify_openrouter_startup()
         self._last_fetch_cause = "unknown"
         self._provider_degraded_until = 0.0
         self.evaluator = Evaluator(settings=self.settings)
@@ -69,71 +68,13 @@ class Validator(AbstractValidator):
         self.registered = bool(resp and getattr(resp, "ok", False))
         if not self.registered:
             raise RuntimeError("Validator registration to platform failed.")
-        
-    def verify_openrouter_startup(self) -> None:
-        token = (self.settings.openrouter_api_token or "").strip()
-        if not token:
-            raise RuntimeError("OPENROUTER_API_TOKEN is required for validator scoring")
-        masked_token = (
-            f"{token[:8]}...{token[-6:]}" if len(token) > 14 else "***masked***"
-        )
-        logging.info(
-            "OpenRouter startup verification using API token fragment: %s",
-            masked_token,
-        )
-
-        llm_client = LLMClient(
-            url=self.settings.openrouter_api_url,
-            api_token=token,
-            model=self.settings.openrouter_model,
-            timeout_seconds=min(self.settings.llm_timeout_seconds, 20.0),
-            max_tokens=min(self.settings.llm_max_tokens, 120),
-            temperature=0.0,
-        )
-
-        prompt = (
-            "Write a short 3-sentence story about a validator node keeping the network healthy."
-        )
-
-        try:
-            async def _probe_and_close():
-                try:
-                    return await llm_client.ask(prompt)
-                finally:
-                    await llm_client.close()
-
-            probe_response = asyncio.run(_probe_and_close())
-            status_code = (
-                probe_response.get("status_code")
-                if isinstance(probe_response, dict)
-                else None
-            )
-            response_text = (
-                probe_response.get("text", "")
-                if isinstance(probe_response, dict)
-                else str(probe_response)
-            )
-            logging.info(
-                "OpenRouter startup verification response: status=%s text=%s",
-                status_code,
-                response_text[:500],
-            )
-            if not response_text.strip():
-                raise RuntimeError(
-                    "OpenRouter startup verification failed: empty response text"
-                )
-            logging.info("OpenRouter startup verification passed")
-        except LLMInsufficientFundsError as exc:
-            raise RuntimeError(
-                "OpenRouter startup verification failed: insufficient funds"
-            ) from exc
-        except Exception as exc:
-            raise RuntimeError(
-                f"OpenRouter startup verification failed: {exc}"
-            ) from exc
 
     def init_settings(self) -> Settings:
         return Settings.from_env()
+
+    @staticmethod
+    def _platform_endpoint(base_url: str, path: str) -> str:
+        return f"{base_url.rstrip('/')}/{path.lstrip('/')}"
     
     async def async_init(self) -> None:
         """Initialize async resources in the correct event loop"""
@@ -303,9 +244,9 @@ class Validator(AbstractValidator):
             logging.error(f"Exception during setting weights: {e}", exc_info=True)
             raise  # Re-raise to see if this is causing the crash
 
-    async def get_tasks_for_eval(self) -> GetChallengesResponse | None:
+    async def get_tasks_for_eval(self) -> SweBenchValidationTask | None:
         try:
-            payload = GetChallengesRequest()
+            payload = GetSweBenchValidationRequest()
             nonce = generate_nonce()
             signature = sign_payload_model(
                 payload=payload, nonce=nonce, wallet=self.settings.wallet
@@ -314,15 +255,14 @@ class Validator(AbstractValidator):
                 payload=payload,
                 sig=signature,
             )
-            logging.info(f"Requesting challenges from platform")
+            request_url = self._platform_endpoint(
+                self.settings.platform_url,
+                self.settings.swebench_validation_request_path,
+            )
+            logging.info("Requesting SWE-Bench validation task from platform")
             try:
-                logging.info(
-                    f"Sending POST to {self.settings.platform_url}/validator/request_challenge"
-                )
-                response = await self.client.post(
-                    f"{self.settings.platform_url}/validator/request_challenge",
-                    json=signed_payload.model_dump(),
-                )
+                logging.info(f"Sending POST to {request_url}")
+                response = await self.client.post(request_url, json=signed_payload.model_dump())
                 logging.info(f"Got response: status={response.status_code}")
                 logging.info("get_tasks_for_eval: Checking response status")
 
@@ -367,7 +307,7 @@ class Validator(AbstractValidator):
                 try:
                     signed = verify_httpx_response(
                         response,
-                        GetChallengesResponse,
+                        GetSweBenchValidationResponse,
                         expected_key=self.settings.platform_signer_ss58,
                     )
                     logging.info(
@@ -385,23 +325,28 @@ class Validator(AbstractValidator):
                     )
                     raise
 
-                # Log compressed challenge payload from platform
-                if hasattr(signed.payload, "challenges"):
+                task = signed.payload.task
+                if task is None:
+                    self._last_fetch_cause = "no_tasks"
+                    logging.info("Platform returned no SWE-Bench validation task")
+                    return None
+
+                if self._has_task_payload(task):
                     logging.info(f"========== PLATFORM RESPONSE ==========")
-                    for idx, c in enumerate(signed.payload.challenges):
-                        logging.info(
-                            f"  Challenge {idx}: id={c.batch_challenge_id}, "
-                            f"text_len={len(c.compressed_text)}, "
-                            f"questions={len(c.challenge_questions)}"
-                        )
+                    logging.info(
+                        "  Validation id=%s instance_id=%s diff_len=%s",
+                        getattr(task, "validation_id", "unknown"),
+                        getattr(task, "instance_id", "unknown"),
+                        len(getattr(task, "diff", "") or ""),
+                    )
 
                 logging.info(
-                    "Fetched challenges",
+                    "Fetched SWE-Bench validation task",
                     extra={"payload": signed.payload.model_dump(mode="json")},
                 )
                 self._last_fetch_cause = "ok"
                 logging.info("get_tasks_for_eval: Returning payload")
-                return signed.payload
+                return task
             except httpx.HTTPError as e:
                 logging.error(
                     f"Failed to fetch challenges (HTTP): {e}\n"
@@ -459,18 +404,68 @@ class Validator(AbstractValidator):
         return max(0.5, min(base_poll_interval, 1.0))
 
     def _resolve_scoring_error_cooldown_seconds(self, error_code: str) -> float:
-        if error_code == "provider_insufficient_funds":
-            return max(30.0, self.settings.llm_provider_error_cooldown_seconds)
-        if error_code.startswith("provider_"):
-            return max(30.0, self.settings.llm_scoring_error_cooldown_seconds)
         if error_code == "validator_scoring_failed":
-            return max(30.0, self.settings.llm_scoring_error_cooldown_seconds)
+            return max(30.0, self.settings.scoring_error_cooldown_seconds)
         return 0.0
+
+    @staticmethod
+    def _task_identifier(task) -> str:
+        validation_id = getattr(task, "validation_id", None)
+        if isinstance(validation_id, int):
+            return str(validation_id)
+        if isinstance(validation_id, str) and validation_id.strip():
+            return validation_id.strip()
+        return "unknown"
+
+    @staticmethod
+    def _task_validation_id(task) -> int:
+        validation_id = getattr(task, "validation_id", None)
+        if isinstance(validation_id, int):
+            return validation_id
+        if isinstance(validation_id, str) and validation_id.strip():
+            return int(validation_id.strip())
+        raise ValueError("task is missing validation_id")
+
+    @staticmethod
+    def _has_task_payload(task) -> bool:
+        if task is None:
+            return False
+        validation_id = getattr(task, "validation_id", None)
+        has_validation_id = isinstance(validation_id, int) or (
+            isinstance(validation_id, str) and validation_id.strip()
+        )
+        return has_validation_id and all(
+            isinstance(getattr(task, attr, None), str)
+            and getattr(task, attr).strip()
+            for attr in ("instance_id", "diff")
+        )
+
+    @staticmethod
+    def _format_error_logs(
+        *,
+        error_code: str,
+        error_message: str,
+        error_details: dict | None,
+        retryable: bool,
+    ) -> str:
+        return json.dumps(
+            {
+                "error_code": error_code,
+                "error_message": error_message,
+                "error_details": error_details or {},
+                "retryable": retryable,
+            },
+            sort_keys=True,
+        )
 
     async def report_results(self, task, results):
         try:
-            payload = PostChallengeScores(
-                batch_id=task.batch_id, question_scores=results["question_scores"]
+            validation_id = self._task_validation_id(task)
+            payload = SubmitSweBenchValidationScoreRequest(
+                validation_id=validation_id,
+                instance_id=task.instance_id,
+                resolved=bool(results["resolved"]),
+                logs=str(results["logs"]),
             )
             nonce = generate_nonce()
             signature = sign_payload_model(
@@ -480,19 +475,22 @@ class Validator(AbstractValidator):
                 payload=payload,
                 sig=signature,
             )
+            submit_url = self._platform_endpoint(
+                self.settings.platform_url,
+                self.settings.swebench_validation_submit_path,
+            )
             logging.info(
-                f"Reporting payload {payload} question scores to platform for batch_id: {task.batch_id}"
+                "Reporting SWE-Bench validation result for validation_id=%s resolved=%s",
+                validation_id,
+                payload.resolved,
             )
             try:
-                response = await self.client.post(
-                    f"{self.settings.platform_url}/validator/score_challenges",
-                    json=signed_payload.model_dump(),
-                )
+                response = await self.client.post(submit_url, json=signed_payload.model_dump())
                 response.raise_for_status()
                 try:
                     signed = verify_httpx_response(
                         response,
-                        PostChallengeScoresResponse,
+                        SubmitSweBenchValidationScoreResponse,
                         expected_key=self.settings.platform_signer_ss58,
                     )
                 except ValueError as verify_exc:
@@ -511,7 +509,7 @@ class Validator(AbstractValidator):
 
     async def report_batch_error(
         self,
-        task: GetChallengesResponse,
+        task: SweBenchValidationTask,
         *,
         error_code: str,
         error_message: str,
@@ -519,45 +517,49 @@ class Validator(AbstractValidator):
         retryable: bool = True,
     ) -> None:
         try:
-            payload = PostChallengeScores(
-                batch_id=task.batch_id,
-                question_scores=[],
-                submission_type=ScoreSubmissionType.ERROR,
-                error_code=error_code,
-                error_message=error_message,
-                error_details=error_details,
-                retryable=retryable,
+            validation_id = self._task_validation_id(task)
+            payload = SubmitSweBenchValidationScoreRequest(
+                validation_id=validation_id,
+                instance_id=task.instance_id,
+                resolved=False,
+                logs=self._format_error_logs(
+                    error_code=error_code,
+                    error_message=error_message,
+                    error_details=error_details,
+                    retryable=retryable,
+                ),
             )
             nonce = generate_nonce()
             signature = sign_payload_model(
                 payload=payload, nonce=nonce, wallet=self.settings.wallet
             )
             signed_payload = SignedEnvelope(payload=payload, sig=signature)
+            submit_url = self._platform_endpoint(
+                self.settings.platform_url,
+                self.settings.swebench_validation_submit_path,
+            )
             logging.warning(
-                "Reporting batch error for batch_id=%s code=%s retryable=%s",
-                task.batch_id,
+                "Reporting SWE-Bench validation failure for validation_id=%s code=%s retryable=%s",
+                validation_id,
                 error_code,
                 retryable,
             )
-            response = await self.client.post(
-                f"{self.settings.platform_url}/validator/score_challenges",
-                json=signed_payload.model_dump(),
-            )
+            response = await self.client.post(submit_url, json=signed_payload.model_dump())
             response.raise_for_status()
             verify_httpx_response(
                 response,
-                PostChallengeScoresResponse,
+                SubmitSweBenchValidationScoreResponse,
                 expected_key=self.settings.platform_signer_ss58,
             )
             logging.info(
-                "Successfully reported batch error for batch_id=%s code=%s",
-                task.batch_id,
+                "Successfully reported SWE-Bench validation failure for validation_id=%s code=%s",
+                validation_id,
                 error_code,
             )
         except Exception as exc:
             logging.error(
-                "Failed to report batch error for batch_id=%s code=%s: %s",
-                getattr(task, "batch_id", "unknown"),
+                "Failed to report SWE-Bench validation failure for task=%s code=%s: %s",
+                self._task_identifier(task),
                 error_code,
                 exc,
                 exc_info=True,
@@ -583,12 +585,15 @@ class Validator(AbstractValidator):
         last_weight_set_block: int | None = None
         weight_task: asyncio.Task | None = None
 
-        async def process_task(task: GetChallengesResponse) -> None:
+        async def process_task(task: SweBenchValidationTask) -> None:
             try:
                 results = await self.evaluator.evaluate(task)
                 # logging.info(f"Async evaluation results: {results}")
                 if results:
-                    logging.info(f"Reporting results for task {task.batch_id}")
+                    logging.info(
+                        "Reporting results for task %s",
+                        self._task_identifier(task),
+                    )
                     await self.report_results(task, results)
             except BatchScoringError as exc:
                 await self.report_batch_error(
@@ -611,7 +616,7 @@ class Validator(AbstractValidator):
                     )
             except Exception as exc:
                 logging.error(
-                    f"Failed to process task {getattr(task, 'batch_id', 'unknown')}: {exc}",
+                    f"Failed to process task {self._task_identifier(task)}: {exc}",
                     exc_info=True,
                 )
                 await self.report_batch_error(
@@ -672,14 +677,14 @@ class Validator(AbstractValidator):
                     task = await self.get_tasks_for_eval()
                     logging.info(f"Got task: {task}")
                     # logging.info(f"Fetched task: {task}")
-                    if task and getattr(task, "challenges", None):
+                    if self._has_task_payload(task):
                         # Successfully got tasks - reset backoff
                         consecutive_no_tasks = 0
                         consecutive_ratio_failures = 0
                         current_poll_interval = base_poll_interval
                         fetch_cooldown_until = now
                         logging.info(
-                            f"Fetched task: {task.batch_id}, reset poll interval to {current_poll_interval}s"
+                            f"Fetched task: {self._task_identifier(task)}, reset poll interval to {current_poll_interval}s"
                         )
                         in_flight.add(asyncio.create_task(process_task(task)))
                     elif task is None:
@@ -806,7 +811,7 @@ def create_app() -> FastAPI:
             server_ts=datetime.now(timezone.utc),
             version=version_check(),
             code_changed=is_code_changed(),
-            model=validator.settings.openrouter_model,
+            model=validator.settings.swebench_eval_model_name,
         )
         nonce = generate_nonce()
         signature = sign_payload_model(
