@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import logging
@@ -43,6 +44,9 @@ class NginxProxyHandle:
 PLUGIN_VENV_DIRNAME = ".soma-openclaw-venv"
 PLUGIN_BACKEND_FILENAME = "base_miner.py"
 PLUGIN_COPY_IGNORE_NAMES = {".git", PLUGIN_VENV_DIRNAME}
+TIKTOKEN_CACHE_DIRNAME = "tiktoken-cache"
+TIKTOKEN_CL100K_URL = "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken"
+TIKTOKEN_CL100K_SHA256 = "223921b76ee99bde995b7ff738513eef100fb51d18c93597a113bcffe865b2a7"
 
 
 def _slug(value: str, *, default: str) -> str:
@@ -202,6 +206,60 @@ def _copy_plugin_template_checkout(*, template_path: Path, plugin_path: Path) ->
         else:
             shutil.copy2(child, destination)
 
+
+def _resolve_tiktoken_cl100k_asset_path() -> Path | None:
+    search_roots = [
+        Path.home() / ".vscode-server" / "cli" / "servers",
+        Path("/root/.vscode-server/cli/servers"),
+    ]
+    candidates: list[Path] = []
+    for root in search_roots:
+        if not root.is_dir():
+            continue
+        candidates.extend(root.glob("*/server/extensions/copilot/dist/cl100k_base.tiktoken"))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda candidate: candidate.stat().st_mtime)
+
+
+def _download_tiktoken_cl100k_payload() -> bytes:
+    timeout_seconds = _get_miner_download_timeout()
+    with urllib_request.urlopen(TIKTOKEN_CL100K_URL, timeout=timeout_seconds) as response:
+        return response.read()
+
+
+def _seed_tiktoken_cache(plugin_path: Path) -> Path | None:
+    payload: bytes | None = None
+
+    try:
+        payload = _download_tiktoken_cl100k_payload()
+        logger.info("Downloaded canonical cl100k_base.tiktoken for plugin cache seeding")
+    except Exception as download_error:
+        asset_path = _resolve_tiktoken_cl100k_asset_path()
+        if asset_path is None or not asset_path.is_file():
+            raise RuntimeError(
+                "Unable to download canonical cl100k_base.tiktoken and no local fallback asset was found"
+            ) from download_error
+        payload = asset_path.read_bytes()
+        logger.warning(
+            "Falling back to local cl100k_base.tiktoken asset for plugin cache seeding: %s",
+            asset_path,
+        )
+
+    digest = hashlib.sha256(payload).hexdigest()
+    if digest != TIKTOKEN_CL100K_SHA256:
+        raise RuntimeError(
+            "Canonical cl100k_base.tiktoken hash mismatch: "
+            f"expected {TIKTOKEN_CL100K_SHA256}, got {digest}"
+        )
+
+    cache_dir = plugin_path / TIKTOKEN_CACHE_DIRNAME
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_key = hashlib.sha1(TIKTOKEN_CL100K_URL.encode("utf-8")).hexdigest()
+    cache_path = cache_dir / cache_key
+    cache_path.write_bytes(payload)
+    return cache_path
+
 class CompactBenchExecutor:
     """Runs compact-bench solve commands and captures produced patches."""
 
@@ -341,8 +399,10 @@ class CompactBenchExecutor:
                 patch_text = patch_file.read_text(encoding="utf-8")
 
         status = str(row.get("status") or ("completed" if process.returncode == 0 else "runtime-error"))
-        error_text = str(row.get("error") or "").strip() or process.stderr.strip() or None
         success = process.returncode == 0 and status == "completed"
+        row_error_text = str(row.get("error") or "").strip() or None
+        stderr_text = process.stderr.strip() or None
+        error_text = row_error_text or (None if success else stderr_text)
         total_tokens, agent_steps = self._extract_execution_metrics(
             row=row,
             metadata=row_metadata,
@@ -356,6 +416,12 @@ class CompactBenchExecutor:
             total_tokens,
             agent_steps,
         )
+        if stderr_text and success:
+            logger.info(
+                "Compact-bench emitted stderr output during successful run: run_id=%s stderr=%s",
+                task.run_id,
+                stderr_text,
+            )
         if error_text:
             logger.warning(
                 "Compact-bench reported error output: run_id=%s error=%s",
@@ -431,10 +497,12 @@ class CompactBenchExecutor:
 
         miner_code = _download_miner_code(script_presigned_url)
         (plugin_path / PLUGIN_BACKEND_FILENAME).write_text(miner_code, encoding="utf-8")
+        cache_path = _seed_tiktoken_cache(plugin_path)
         logger.info(
-            "Injected miner code into plugin checkout: plugin_path=%s code_bytes=%s",
+            "Injected miner code into plugin checkout: plugin_path=%s code_bytes=%s tiktoken_cache=%s",
             plugin_path,
             len(miner_code.encode("utf-8")),
+            cache_path,
         )
 
         return plugin_path
@@ -595,6 +663,9 @@ class CompactBenchExecutor:
             row.get("steps"),
             metadata.get("steps"),
             (metadata.get("agent") or {}).get("steps") if isinstance(metadata.get("agent"), dict) else None,
+            (metadata.get("token_usage") or {}).get("model_calls_count") if isinstance(metadata.get("token_usage"), dict) else None,
+            (metadata.get("token_usage") or {}).get("assistant_usage_count") if isinstance(metadata.get("token_usage"), dict) else None,
+            (metadata.get("session_index") or {}).get("message_count") if isinstance(metadata.get("session_index"), dict) else None,
         ):
             value = _step_count(candidate)
             if value is not None:
