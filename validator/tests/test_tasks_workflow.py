@@ -5,6 +5,7 @@ import json
 from types import SimpleNamespace
 from unittest.mock import Mock, patch, AsyncMock, MagicMock
 
+import docker
 import pytest
 
 TESTS_DIR = os.path.dirname(__file__)
@@ -391,3 +392,146 @@ def test_has_task_payload_accepts_swebench_validation_task():
     )
     assert Validator._has_task_payload(task) is True
     assert Validator._task_identifier(task) == "42"
+
+
+@pytest.mark.asyncio
+@pytest.mark.network
+async def test_validator_e2e_with_mocked_task_uses_sandbox_controls(monkeypatch):
+    client = None
+    try:
+        client = docker.from_env(timeout=600)
+        client.ping()
+    except Exception as exc:
+        if client is not None:
+            client.close()
+        pytest.skip(f"Docker is unavailable for validator e2e sandbox test: {exc}")
+
+    validator = _make_validator()
+    validator.settings.max_concurrent_evaluations = 1
+    validator.settings.swebench_dataset_name = "SWE-bench/SWE-bench_Verified"
+    validator.settings.swebench_dataset_split = "test"
+    validator.settings.swebench_eval_arch = "x86_64"
+    validator.settings.swebench_eval_timeout_seconds = 1800
+    validator.settings.swebench_eval_model_name = "validator-e2e-sandbox-test"
+    validator.evaluator = Evaluator(settings=validator.settings)
+
+    harness = validator.evaluator._swebench_evaluator._load_harness_api()
+    dataset = harness.load_swebench_dataset(
+        name="SWE-bench/SWE-bench_Verified",
+        split="test",
+        instance_ids=["django__django-11119"],
+    )
+    row = dict(dataset[0])
+
+    task = SweBenchValidationTask(
+        validation_id=6,
+        instance_id="django__django-11119",
+        diff=row["patch"],
+        arch="x86_64",
+    )
+    validator.get_tasks_for_eval = AsyncMock(return_value=task)
+
+    observed: dict[str, object] = {}
+
+    class _RecordingContainers:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def create(self, *args, **kwargs):
+            observed["container_create_kwargs"] = dict(kwargs)
+            container = self._inner.create(*args, **kwargs)
+            details = container.client.api.inspect_container(container.id)
+            host_config = details.get("HostConfig", {})
+            config = details.get("Config", {})
+            observed["container_inspect"] = {
+                "network_mode": host_config.get("NetworkMode"),
+                "cap_drop": host_config.get("CapDrop") or [],
+                "security_opt": host_config.get("SecurityOpt") or [],
+                "pids_limit": host_config.get("PidsLimit"),
+                "user": config.get("User"),
+            }
+            return container
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    class _RecordingDockerClient:
+        def __init__(self, inner):
+            self._inner = inner
+            self.containers = _RecordingContainers(inner.containers)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def close(self):
+            return self._inner.close()
+
+    import swebench.harness.eval as harness_eval
+
+    original_exec_run_with_timeout = harness_eval.exec_run_with_timeout
+
+    def _recording_exec_run_with_timeout(container, cmd, timeout, *, user=None, workdir=None):
+        observed["eval_exec"] = {
+            "cmd": cmd,
+            "timeout": timeout,
+            "user": user,
+            "workdir": workdir,
+        }
+        return original_exec_run_with_timeout(
+            container,
+            cmd,
+            timeout,
+            user=user,
+            workdir=workdir,
+        )
+
+    monkeypatch.setattr(
+        docker,
+        "from_env",
+        lambda timeout=600: _RecordingDockerClient(client),
+    )
+    monkeypatch.setattr(
+        harness_eval,
+        "exec_run_with_timeout",
+        _recording_exec_run_with_timeout,
+    )
+
+    response = Mock()
+    response.status_code = 200
+    response.raise_for_status = Mock()
+    signed = SignedEnvelope(
+        payload=SubmitSweBenchValidationScoreResponse(ok=True),
+        sig=Signature(signer_ss58="expected-signer", nonce="n", signature="s"),
+    )
+
+    with (
+        patch("validator.validator.generate_nonce", return_value="n"),
+        patch("validator.validator.sign_payload_model", return_value=signed.sig),
+        patch("validator.validator.verify_httpx_response", return_value=signed),
+    ):
+        validator.client = _mock_client(response)
+
+        fetched_task = await validator.get_tasks_for_eval()
+        results = await validator.evaluator.evaluate(fetched_task)
+        await validator.report_results(fetched_task, results)
+
+    validator.get_tasks_for_eval.assert_awaited_once()
+    assert results["resolved"] is True
+    assert validator.client.post.call_count == 1
+
+    create_kwargs = observed["container_create_kwargs"]
+    assert create_kwargs["network_mode"] == "none"
+    assert create_kwargs["cap_drop"] == ["ALL"]
+    assert create_kwargs["security_opt"] == ["no-new-privileges:true"]
+    assert create_kwargs["pids_limit"] == 512
+
+    container_inspect = observed["container_inspect"]
+    assert container_inspect["network_mode"] == "none"
+    assert {value.upper() for value in container_inspect["cap_drop"]} == {"ALL"}
+    assert container_inspect["security_opt"] == ["no-new-privileges:true"]
+    assert container_inspect["pids_limit"] == 512
+
+    eval_exec = observed["eval_exec"]
+    assert eval_exec["cmd"] == "/bin/bash /tmp/eval.sh"
+    assert eval_exec["user"] == "nonroot"
+    assert eval_exec["workdir"] == "/testbed"
