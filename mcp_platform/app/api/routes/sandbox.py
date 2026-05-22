@@ -45,11 +45,13 @@ async def _persist_compact_bench_report(
         return False
 
     run.agent_steps = payload.agent_steps
-    # TODO: replace this with the S3 path/UUID in the callback contract instead of full patch payload.
-    if payload.patch_diff:
-        run.diff_storage_uuid = payload.patch_diff
     run.tokens_used = payload.total_tokens
     run.time_taken_seconds = payload.execution_time_seconds
+    run.last_error = payload.error
+    if payload.ok_status and payload.patch_capture_status:
+        run.status = "completed"
+    else:
+        run.status = "failed"
 
     await db.commit()
     return True

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import itertools
 from typing import Any
 
 import httpx
@@ -19,7 +18,6 @@ from app.services.sandbox.base import (
 
 
 logger = get_logger(__name__)
-_RUN_ID_COUNTER = itertools.count(1)
 
 
 class RemoteCompactBenchManager:
@@ -45,7 +43,12 @@ class RemoteCompactBenchManager:
         challenge_text: str,
         task_context: dict[str, Any],
     ) -> SandboxTaskResult:
-        run_id = next(_RUN_ID_COUNTER)
+        run_id = task_context.get("run_id")
+        if run_id is None:
+            raise SandboxExecutionError(
+                "Compact-bench dispatch requires task_context['run_id'] mapped to swe_bench_runs.id."
+            )
+        run_id = int(run_id)
         payload = self._build_task_request(
             run_id=run_id,
             task_context=task_context,
@@ -66,7 +69,7 @@ class RemoteCompactBenchManager:
                     timeout=dispatch_timeout,
                 )
             except Exception as exc:
-                task_error = self._format_dispatch_error(exc)
+                task_error, _ = self._format_dispatch_error(exc)
                 dispatch_result = None
         if dispatch_result is not None and dispatch_result.success:
             dispatch_accepted = True
@@ -161,17 +164,56 @@ class RemoteCompactBenchManager:
         response.raise_for_status()
         return CompactBenchRunTaskResponse.model_validate(response.json())
 
-    def _format_dispatch_error(self, exc: Exception) -> str:
+    def _format_dispatch_error(self, exc: Exception) -> tuple[str, bool]:
         if isinstance(exc, httpx.TimeoutException):
-            return "Compact-bench service acknowledgement timed out"
+            return "Compact-bench service acknowledgement timed out", True
         if isinstance(exc, httpx.HTTPStatusError):
             if exc.response.status_code == 429:
                 return (
                     "Platform is at capacity. The compact-bench service is currently handling the maximum "
                     "number of concurrent requests. Please try again later."
+                ), True
+            if exc.response.status_code >= 500:
+                return f"Compact-bench service returned HTTP {exc.response.status_code}", True
+            return f"Compact-bench service returned HTTP {exc.response.status_code}", False
+        return f"Failed to communicate with compact-bench service: {exc}", True
+
+    async def dispatch_swebench_run(
+        self,
+        *,
+        run_id: int,
+        benchmark: str,
+        instance_id: str,
+        storage_uuid: str,
+        storage_presigned_url: str,
+        task_context: dict[str, Any] | None = None,
+    ) -> tuple[bool, str | None, bool]:
+        context = dict(task_context or {})
+        context.setdefault("benchmark", benchmark)
+        context.setdefault("instance_id", instance_id)
+        context.setdefault("run_id", int(run_id))
+        payload = self._build_task_request(
+            run_id=int(run_id),
+            task_context=context,
+            storage_uuid=storage_uuid,
+            storage_presigned_url=storage_presigned_url,
+            challenge_text="",
+        )
+        timeout = max(1.0, float(self._submission_timeout_seconds))
+        async with httpx.AsyncClient() as client:
+            try:
+                dispatch_result = await self._dispatch_task(
+                    client=client,
+                    payload=payload,
+                    timeout=timeout,
                 )
-            return f"Compact-bench service returned HTTP {exc.response.status_code}"
-        return f"Failed to communicate with compact-bench service: {exc}"
+            except Exception as exc:
+                error, retryable = self._format_dispatch_error(exc)
+                return False, error, retryable
+
+        if dispatch_result.success:
+            return True, None, False
+        return False, "Compact-bench service rejected task dispatch", False
 
     def shutdown(self) -> None:
         logger.info("[RemoteCompactBench] Shutdown complete")
