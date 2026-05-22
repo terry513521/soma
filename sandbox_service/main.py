@@ -107,6 +107,12 @@ def _get_compact_bench_report_timeout() -> float:
 
 async def _send_compact_bench_report(report: CompactBenchReportRequest) -> None:
     report_url = _get_compact_bench_report_url()
+    logger.info(
+        "Sending compact-bench report: run_id=%s ok_status=%s report_url=%s",
+        report.run_id,
+        report.ok_status,
+        report_url,
+    )
     async with httpx.AsyncClient() as http_client:
         response = await http_client.post(
             report_url,
@@ -114,16 +120,33 @@ async def _send_compact_bench_report(report: CompactBenchReportRequest) -> None:
             timeout=_get_compact_bench_report_timeout(),
         )
         response.raise_for_status()
+    logger.info(
+        "Compact-bench report delivered: run_id=%s status_code=%s",
+        report.run_id,
+        response.status_code,
+    )
 
 
 async def _execute_compact_bench_task_in_background(request: CompactBenchRunTaskRequest) -> None:
     try:
         executor = get_compact_bench_executor()
+        logger.info(
+            "Starting compact-bench background execution: run_id=%s benchmark=%s instance_id=%s",
+            request.run_id,
+            request.benchmark,
+            request.instance_id,
+        )
         output = await asyncio.to_thread(
             executor.execute_task,
             batch_id=str(request.run_id),
             task=request,
             timeout_per_task=request.openclaw_timeout,
+        )
+        logger.info(
+            "Compact-bench execution finished: run_id=%s ok_status=%s execution_time_seconds=%s",
+            request.run_id,
+            output.report.ok_status,
+            output.report.execution_time_seconds,
         )
 
         await _send_compact_bench_report(output.report)
@@ -158,6 +181,7 @@ async def _execute_compact_bench_task_in_background(request: CompactBenchRunTask
                 extra={"run_id": request.run_id},
             )
     finally:
+        logger.info("Releasing compact-bench capacity slot: run_id=%s", request.run_id)
         _release_capacity_slot()
 
 @app.post("/run_compact_bench_task", response_model=CompactBenchRunTaskResponse)

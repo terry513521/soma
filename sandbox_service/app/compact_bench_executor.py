@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import logging
 import os
 import shlex
 import shutil
@@ -20,6 +21,9 @@ from soma_shared.contracts.sandbox.v1.messages import (
     CompactBenchReportRequest,
     CompactBenchRunTaskRequest,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -231,23 +235,52 @@ class CompactBenchExecutor:
             default="task",
         )
         output_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(
+            "Compact-bench executor preparing run: run_id=%s benchmark=%s instance_id=%s output_dir=%s",
+            task.run_id,
+            task.benchmark,
+            task.instance_id,
+            output_dir,
+        )
 
         plugin_path = self._materialize_plugin_checkout(
             output_dir=output_dir,
             script_presigned_url=task.script_presigned_url,
         )
+        logger.info(
+            "Compact-bench plugin prepared: run_id=%s plugin_path=%s",
+            task.run_id,
+            plugin_path,
+        )
         command = self._build_command(task=task, output_dir=output_dir)
         env = os.environ.copy()
         llm_base_url = os.getenv("COMPACT_BENCH_LLM_BASE_URL", "").strip()
         if llm_base_url:
+            logger.info(
+                "Ensuring compact-bench LLM proxy: run_id=%s upstream_host=%s",
+                task.run_id,
+                urlsplit(llm_base_url).netloc,
+            )
             proxy_handle = self._ensure_llm_proxy(llm_base_url)
             env["LLM_BASE_URL"] = proxy_handle.proxy_base_url
             env["SOMA_OPENCLAW_PRIVATE_NETWORK_NAME"] = proxy_handle.private_network_name
+            logger.info(
+                "Compact-bench LLM proxy ready: run_id=%s proxy_base_url=%s private_network=%s",
+                task.run_id,
+                proxy_handle.proxy_base_url,
+                proxy_handle.private_network_name,
+            )
         env["SOMA_OPENCLAW_SOMARIZER_PLUGIN_PATH"] = str(plugin_path)
 
         effective_timeout = task.openclaw_timeout if task.openclaw_timeout is not None else timeout_per_task
         timeout = max(1.0, float(effective_timeout)) if effective_timeout is not None else None
         started_at = time.monotonic()
+        logger.info(
+            "Starting compact-bench solve command: run_id=%s timeout_seconds=%s command=%s",
+            task.run_id,
+            timeout,
+            shlex.join(command),
+        )
         try:
             process = subprocess.run(
                 command,
@@ -259,6 +292,12 @@ class CompactBenchExecutor:
             )
         except subprocess.TimeoutExpired as exc:
             duration = time.monotonic() - started_at
+            logger.error(
+                "Compact-bench solve command timed out: run_id=%s duration_seconds=%.3f timeout_seconds=%s",
+                task.run_id,
+                duration,
+                timeout,
+            )
             metadata = dict(task.metadata)
             metadata.update(
                 {
@@ -283,6 +322,12 @@ class CompactBenchExecutor:
             return CompactBenchExecutionOutput(report=report, patch_text="")
 
         duration = time.monotonic() - started_at
+        logger.info(
+            "Compact-bench solve command finished: run_id=%s returncode=%s duration_seconds=%.3f",
+            task.run_id,
+            process.returncode,
+            duration,
+        )
         row = self._read_result_row(output_dir)
         row_metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
         patch_capture = row_metadata.get("patch_capture") if isinstance(row_metadata.get("patch_capture"), dict) else {}
@@ -302,6 +347,21 @@ class CompactBenchExecutor:
             row=row,
             metadata=row_metadata,
         )
+        logger.info(
+            "Compact-bench result parsed: run_id=%s status=%s ok_status=%s patch_capture_status=%s total_tokens=%s agent_steps=%s",
+            task.run_id,
+            status,
+            success,
+            patch_capture_status,
+            total_tokens,
+            agent_steps,
+        )
+        if error_text:
+            logger.warning(
+                "Compact-bench reported error output: run_id=%s error=%s",
+                task.run_id,
+                error_text,
+            )
         metadata = dict(task.metadata)
         metadata.update(row_metadata)
         metadata.update(
@@ -349,6 +409,8 @@ class CompactBenchExecutor:
             "--openclaw-run-id-header-value",
             str(task.run_id),
         ]
+        if task.agent_name == "openclaw":
+            command.append("--openclaw-ignore-api-key")
         if task.model:
             command.extend(["--model", task.model])
         if task.openclaw_disable_somarizer:
@@ -359,16 +421,21 @@ class CompactBenchExecutor:
         template_path = _resolve_plugin_template_path()
         plugin_path = output_dir / "soma-miner-plugin"
         plugin_path.mkdir(parents=True, exist_ok=True)
+        logger.info(
+            "Materializing plugin checkout: output_dir=%s template_path=%s",
+            output_dir,
+            template_path,
+        )
 
         _copy_plugin_template_checkout(template_path=template_path, plugin_path=plugin_path)
 
         miner_code = _download_miner_code(script_presigned_url)
         (plugin_path / PLUGIN_BACKEND_FILENAME).write_text(miner_code, encoding="utf-8")
-
-        template_venv_path = template_path / PLUGIN_VENV_DIRNAME
-        plugin_venv_path = plugin_path / PLUGIN_VENV_DIRNAME
-        if template_venv_path.exists() and not plugin_venv_path.exists():
-            plugin_venv_path.symlink_to(template_venv_path, target_is_directory=True)
+        logger.info(
+            "Injected miner code into plugin checkout: plugin_path=%s code_bytes=%s",
+            plugin_path,
+            len(miner_code.encode("utf-8")),
+        )
 
         return plugin_path
 
@@ -413,6 +480,13 @@ class CompactBenchExecutor:
             )
         )
         _ensure_docker_network(private_network_name, internal=True)
+        logger.info(
+            "Starting compact-bench nginx proxy: container_name=%s upstream_host=%s private_network=%s proxy_port=%s",
+            container_name,
+            urlsplit(upstream_base_url).netloc,
+            private_network_name,
+            proxy_port,
+        )
 
         result = _run_command(
             [
@@ -444,6 +518,12 @@ class CompactBenchExecutor:
                 )
             )
             raise
+        logger.info(
+            "Compact-bench nginx proxy ready: container_name=%s proxy_base_url=http://%s:%s",
+            container_name,
+            container_name,
+            proxy_port,
+        )
 
         return NginxProxyHandle(
             container_name=container_name,
