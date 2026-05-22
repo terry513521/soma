@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import inspect
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -18,6 +19,8 @@ DEFAULT_ARCH = "x86_64"
 DEFAULT_IMAGE_TEMPLATE = "ghcr.io/epoch-research/swe-bench.eval.{arch}.{instance_id}"
 DEFAULT_MODEL_NAME = "soma-validator"
 DEFAULT_REMOVE_IMAGE_AFTER_RUN = True
+DEFAULT_CONTAINER_PIDS_LIMIT = 512
+DEFAULT_CONTAINER_RUNTIME_USER = "nonroot"
 SUPPORTED_ARCHES = {"x86_64", "arm64"}
 RUN_EVALUATION_LOG_DIR = Path("logs/run_evaluation")
 LOG_TEST_OUTPUT = "test_output.txt"
@@ -141,7 +144,12 @@ class SWEBenchContainerEvaluator:
 
             instance = dict(dataset[0])
             instance["image_name"] = resolved_image_name
-            test_spec = harness.make_test_spec(instance, namespace=None, instance_image_tag="latest")
+            test_spec = harness.make_test_spec(
+                instance,
+                namespace=None,
+                instance_image_tag="latest",
+            )
+            self._prefer_nonroot_test_execution(test_spec)
             if getattr(test_spec, "arch", None) != resolved_arch:
                 test_spec.arch = resolved_arch
 
@@ -155,6 +163,7 @@ class SWEBenchContainerEvaluator:
             }
 
             client = harness.docker.from_env(timeout=600)
+            container_kwargs = self._sandbox_container_kwargs()
             _, report = harness.run_instance(
                 test_spec,
                 prediction,
@@ -168,6 +177,8 @@ class SWEBenchContainerEvaluator:
                 client,
                 run_id,
                 timeout_seconds,
+                container_kwargs=container_kwargs,
+                **self._run_instance_kwargs(harness.run_instance),
             )
             resolved = bool(report.get(normalized_instance_id, {}).get("resolved"))
             logs = self._load_test_output_logs(
@@ -194,6 +205,40 @@ class SWEBenchContainerEvaluator:
                     client.close()
                 except Exception:
                     logger.debug("Failed to close Docker client", exc_info=True)
+
+    @staticmethod
+    def _sandbox_container_kwargs() -> dict[str, object]:
+        return {
+            "network_mode": "none",
+            "cap_drop": ["ALL"],
+            "security_opt": ["no-new-privileges:true"],
+            "pids_limit": DEFAULT_CONTAINER_PIDS_LIMIT,
+        }
+
+    @staticmethod
+    def _prefer_nonroot_test_execution(test_spec: object) -> None:
+        try:
+            setattr(test_spec, "execute_test_as_nonroot", True)
+        except Exception:
+            logger.debug("Failed to mark SWE-Bench test spec for non-root execution", exc_info=True)
+
+    @staticmethod
+    def _run_instance_kwargs(run_instance) -> dict[str, object]:
+        try:
+            signature = inspect.signature(run_instance)
+        except (TypeError, ValueError):
+            return {}
+
+        if "runtime_user" in signature.parameters:
+            return {"runtime_user": DEFAULT_CONTAINER_RUNTIME_USER}
+
+        if any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        ):
+            return {"runtime_user": DEFAULT_CONTAINER_RUNTIME_USER}
+
+        return {}
 
     def _load_harness_api(self):
         try:

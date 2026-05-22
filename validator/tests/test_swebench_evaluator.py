@@ -81,13 +81,25 @@ def test_sync_runner_uses_explicit_image_and_returns_binary_success(monkeypatch)
         observed["instance_image_tag"] = instance_image_tag
         return fake_test_spec
 
-    def fake_run_instance(test_spec, prediction, rm_image, force_rebuild, client, run_id, timeout):
+    def fake_run_instance(
+        test_spec,
+        prediction,
+        rm_image,
+        force_rebuild,
+        client,
+        run_id,
+        timeout,
+        container_kwargs=None,
+        runtime_user=None,
+    ):
         observed["prediction"] = dict(prediction)
         observed["rm_image"] = rm_image
         observed["force_rebuild"] = force_rebuild
         observed["client"] = client
         observed["run_id"] = run_id
         observed["timeout"] = timeout
+        observed["container_kwargs"] = dict(container_kwargs or {})
+        observed["runtime_user"] = runtime_user
         assert test_spec is fake_test_spec
         return prediction["instance_id"], {
             prediction["instance_id"]: {"resolved": True}
@@ -117,6 +129,7 @@ def test_sync_runner_uses_explicit_image_and_returns_binary_success(monkeypatch)
     assert result.resolved is True
     assert result.image_name == "ghcr.io/epoch-research/custom-image:latest"
     assert fake_test_spec.arch == "arm64"
+    assert fake_test_spec.execute_test_as_nonroot is True
     assert observed["instance"]["image_name"] == "ghcr.io/epoch-research/custom-image:latest"
     assert observed["namespace"] is None
     assert observed["instance_image_tag"] == "latest"
@@ -129,7 +142,14 @@ def test_sync_runner_uses_explicit_image_and_returns_binary_success(monkeypatch)
     assert observed["force_rebuild"] is False
     assert observed["client"] is fake_client
     assert observed["timeout"] == 123
+    assert observed["runtime_user"] == "nonroot"
     assert observed["run_id"].startswith("validator-django--django-11119-")
+    assert observed["container_kwargs"] == {
+        "network_mode": "none",
+        "cap_drop": ["ALL"],
+        "security_opt": ["no-new-privileges:true"],
+        "pids_limit": 512,
+    }
 
 
 def test_sync_runner_can_disable_image_cleanup(monkeypatch):
@@ -143,9 +163,19 @@ def test_sync_runner_can_disable_image_cleanup(monkeypatch):
     fake_test_spec = SimpleNamespace(arch="x86_64")
     observed = {}
 
-    def fake_run_instance(test_spec, prediction, rm_image, force_rebuild, client, run_id, timeout):
+    def fake_run_instance(
+        test_spec,
+        prediction,
+        rm_image,
+        force_rebuild,
+        client,
+        run_id,
+        timeout,
+        container_kwargs=None,
+    ):
         observed["rm_image"] = rm_image
         observed["force_rebuild"] = force_rebuild
+        observed["container_kwargs"] = dict(container_kwargs or {})
         return prediction["instance_id"], {
             prediction["instance_id"]: {"resolved": True}
         }
@@ -169,8 +199,15 @@ def test_sync_runner_can_disable_image_cleanup(monkeypatch):
     )
 
     assert result.score == 1
+    assert fake_test_spec.execute_test_as_nonroot is True
     assert observed["rm_image"] is False
     assert observed["force_rebuild"] is False
+    assert observed["container_kwargs"] == {
+        "network_mode": "none",
+        "cap_drop": ["ALL"],
+        "security_opt": ["no-new-privileges:true"],
+        "pids_limit": 512,
+    }
 
 
 def test_load_harness_api_requires_installed_package(monkeypatch):
@@ -250,7 +287,16 @@ def test_sync_runner_reads_extracted_test_logs_from_harness_output(monkeypatch, 
     fake_client = SimpleNamespace(close=lambda: None)
     fake_test_spec = SimpleNamespace(arch="x86_64")
 
-    def fake_run_instance(test_spec, prediction, rm_image, force_rebuild, client, run_id, timeout):
+    def fake_run_instance(
+        test_spec,
+        prediction,
+        rm_image,
+        force_rebuild,
+        client,
+        run_id,
+        timeout,
+        container_kwargs=None,
+    ):
         log_dir = (
             tmp_path
             / "logs"
