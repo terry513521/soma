@@ -590,13 +590,12 @@ async def get_active_competitions(
     request: Request,
     db: AsyncSession = Depends(get_db_session),
 ) -> list[MinerCompetitionItem]:
-    # Temporary endpoint for competition list - needs to be changed in the future
     rows = (
         await db.execute(
             select(
-                V_ACTIVE_COMPETITION.c.competition_id,
-                V_ACTIVE_COMPETITION.c.competition_name,
-            ).order_by(V_ACTIVE_COMPETITION.c.competition_id)
+                Competition.id.label("competition_id"),
+                Competition.competition_name,
+            ).order_by(Competition.id.asc())
         )
     ).all()
 
