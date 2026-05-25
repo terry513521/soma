@@ -5,7 +5,7 @@ from soma_shared.contracts.validator.v1.messages import (
     ValidatorRegisterRequest,
     ValidatorRegisterResponse,
     HeartbeatRequest,
-    GetChallengesResponse,
+    SweBenchValidationTask,
 )
 
 if TYPE_CHECKING:
@@ -69,19 +69,19 @@ class AbstractValidator(ABC):
         return NotImplementedError
 
     @abstractmethod
-    def get_tasks_for_eval(self) -> GetChallengesResponse | None:
+    async def get_tasks_for_eval(self) -> SweBenchValidationTask | None:
         """
         Fetch tasks to be evaluated from the platform.
-        Calls an PLATFORM_URL/api/v1/validator/request_challenge endpoint.
+        Calls an PLATFORM_URL/api/v1/validator/get_swebench_validation endpoint.
         """
         # should call evaluate after fetching tasks
         return NotImplementedError
 
     @abstractmethod
-    def report_results(self, task: Any, results: Any) -> None:
+    async def report_results(self, task: Any, results: Any) -> None:
         """
         Send results back to the platform.
-        Calls an PLATFORM_URL/api/v1/validator/score_challenges endpoint.
+        Calls an PLATFORM_URL/api/v1/validator/submit_swebench_validation_score endpoint.
         with the results from the evaluation.
         """
         return NotImplementedError

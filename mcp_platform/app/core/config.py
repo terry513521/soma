@@ -4,7 +4,7 @@ import json
 import subprocess
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import quote
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -139,6 +139,10 @@ class Settings(BaseSettings):
         default=600.0,
         alias="VALIDATOR_OPENROUTER_ERROR_COOLDOWN_SECONDS",
     )
+    openrouter_ssm_prefix: str = Field(
+        default="/s114/dev",
+        alias="OPENROUTER_SSM_PREFIX",
+    )
 
     # Materialized view refresh
     # Fast views: mv_miner_status, mv_miner_screener_stats, mv_miner_competition_stats
@@ -156,17 +160,12 @@ class Settings(BaseSettings):
     sandbox_timeout_per_task_seconds: float = Field(
         default=10.0,
         alias="SANDBOX_TIMEOUT_PER_TASK_SECONDS",
-        description="Timeout for executing one compression task",
+        description="Maximum execution time forwarded to one sandbox task",
     )
-    sandbox_container_timeout_offset: float = Field(
+    sandbox_submission_timeout_seconds: float = Field(
         default=10.0,
-        alias="SANDBOX_CONTAINER_TIMEOUT_OFFSET",
-        description="Extra time for container overhead (startup, I/O, etc.)",
-    )
-    sandbox_request_timeout_offset: float = Field(
-        default=20.0,
-        alias="SANDBOX_REQUEST_TIMEOUT_OFFSET",
-        description="Extra time for HTTP request (must be > container offset)",
+        alias="SANDBOX_SUBMISSION_TIMEOUT_SECONDS",
+        description="Timeout for waiting on sandbox task acceptance response",
     )
 
     # Validator stake requirements
@@ -188,6 +187,50 @@ class Settings(BaseSettings):
     sandbox_service_url: str = Field(
         ...,
         alias="SANDBOX_SERVICE_URL",
+    )
+    compact_bench_service_url: str | None = Field(
+        default=None,
+        alias="COMPACT_BENCH_SERVICE_URL",
+    )
+    swebench_benchmark_name: str = Field(
+        default="SWE-bench/SWE-bench_Verified",
+        alias="SWEBENCH_BENCHMARK_NAME",
+    )
+    swebench_default_model: str = Field(
+        default="qwen/qwen3-coder",
+        alias="SWEBENCH_DEFAULT_MODEL",
+    )
+    swebench_orchestrator_interval_seconds: float = Field(
+        default=2.0,
+        alias="SWEBENCH_ORCHESTRATOR_INTERVAL_SECONDS",
+    )
+    swebench_dispatch_batch_size: int = Field(
+        default=8,
+        alias="SWEBENCH_DISPATCH_BATCH_SIZE",
+    )
+    swebench_retry_base_seconds: float = Field(
+        default=5.0,
+        alias="SWEBENCH_RETRY_BASE_SECONDS",
+    )
+    swebench_retry_max_seconds: float = Field(
+        default=120.0,
+        alias="SWEBENCH_RETRY_MAX_SECONDS",
+    )
+    swebench_retry_jitter_seconds: float = Field(
+        default=2.0,
+        alias="SWEBENCH_RETRY_JITTER_SECONDS",
+    )
+    swebench_validation_claim_ttl_seconds: int = Field(
+        default=900,
+        alias="SWEBENCH_VALIDATION_CLAIM_TTL_SECONDS",
+    )
+    swebench_screening_min_passed_tasks: int = Field(
+        default=0,
+        alias="SWEBENCH_SCREENING_MIN_PASSED_TASKS",
+    )
+    swebench_screening_pass_ratio: float = Field(
+        default=0.5,
+        alias="SWEBENCH_SCREENING_PASS_RATIO",
     )
 
     @field_validator("log_levels", mode="before")
@@ -304,6 +347,38 @@ class Settings(BaseSettings):
         except (TypeError, ValueError) as exc:
             raise ValueError("SCREENER_EXTRA_SCORE_POINTS must be a number") from exc
         # Accept either ratio [0..1] or percent points [0..100].
+        if numeric > 1:
+            if numeric > 100:
+                numeric = 100.0
+            numeric = numeric / 100.0
+        if numeric < 0:
+            numeric = 0.0
+        if numeric > 1:
+            numeric = 1.0
+        return numeric
+
+    @field_validator("swebench_screening_min_passed_tasks", mode="before")
+    @classmethod
+    def _parse_swebench_screening_min_passed_tasks(cls, value: Any) -> int:
+        if value is None or value == "":
+            return 0
+        try:
+            numeric = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "SWEBENCH_SCREENING_MIN_PASSED_TASKS must be an integer"
+            ) from exc
+        return max(0, numeric)
+
+    @field_validator("swebench_screening_pass_ratio", mode="before")
+    @classmethod
+    def _parse_swebench_screening_pass_ratio(cls, value: Any) -> float:
+        if value is None or value == "":
+            return 0.5
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("SWEBENCH_SCREENING_PASS_RATIO must be a number") from exc
         if numeric > 1:
             if numeric > 100:
                 numeric = 100.0

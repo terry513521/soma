@@ -10,6 +10,7 @@ SQLAlchemy==2.0.39
 asyncpg
 
 aioboto3==13.2.0
+aiocache==0.12.3
 docker>=7.1.0
 httpx==0.26.0
 

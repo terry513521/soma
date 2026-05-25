@@ -22,18 +22,21 @@ class Settings(BaseModel):
     task_poll_interval_seconds: float
     max_backoff_interval_seconds: float
     backoff_multiplier: float
-    # LLM Scoring settings
+    # Validator scoring settings
     max_concurrent_evaluations: int
-    openrouter_api_url: str
-    openrouter_api_token: str
-    openrouter_model: str
-    llm_timeout_seconds: float
-    llm_max_tokens: int
-    llm_temperature: float
-    llm_provider_error_cooldown_seconds: float
-    llm_scoring_error_cooldown_seconds: float
+    scoring_error_cooldown_seconds: float
+    hf_rate_limit_cooldown_seconds: float
     http_timeout_seconds: float
     weight_block_interval:int
+    swebench_dataset_name: str
+    swebench_dataset_split: str
+    swebench_eval_arch: str
+    swebench_eval_timeout_seconds: int
+    swebench_eval_image_template: str
+    swebench_eval_model_name: str
+    swebench_eval_remove_image_after_run: bool
+    swebench_validation_request_path: str
+    swebench_validation_submit_path: str
      
     @classmethod
     def from_env(cls) -> "Settings":
@@ -80,22 +83,48 @@ class Settings(BaseModel):
             ),
             backoff_multiplier=cls._get_float("BACKOFF_MULTIPLIER", 2.0),
             max_concurrent_evaluations=cls._get_int("MAX_CONCURRENT_EVALUATIONS", 4),
-            openrouter_api_url=os.getenv(
-                "OPENROUTER_API_URL", "https://openrouter.ai/api/v1/chat/completions"
+            scoring_error_cooldown_seconds=cls._get_float(
+                "SCORING_ERROR_COOLDOWN_SECONDS",
+                600.0,
             ),
-            openrouter_api_token=os.getenv("OPENROUTER_API_TOKEN", ""),
-            openrouter_model=os.getenv("OPENROUTER_MODEL", "openai/gpt-4.1-mini"),
-            llm_timeout_seconds=cls._get_float("LLM_TIMEOUT_SECONDS", 240),
-            llm_max_tokens=4096,
-            llm_temperature=cls._get_float("LLM_TEMPERATURE", 0),
-            llm_provider_error_cooldown_seconds=cls._get_float(
-                "LLM_PROVIDER_ERROR_COOLDOWN_SECONDS", 600.0
-            ),
-            llm_scoring_error_cooldown_seconds=cls._get_float(
-                "LLM_SCORING_ERROR_COOLDOWN_SECONDS", 600.0
+            hf_rate_limit_cooldown_seconds=cls._get_float(
+                "HF_RATE_LIMIT_COOLDOWN_SECONDS",
+                120.0,
             ),
             http_timeout_seconds = cls._get_float("HTTP_TIMEOUT_SECONDS", 240.0),
-            weight_block_interval = 110
+            weight_block_interval = 110,
+            swebench_dataset_name=os.getenv(
+                "SWEBENCH_DATASET_NAME", "SWE-bench/SWE-bench_Verified"
+            ),
+            swebench_dataset_split=os.getenv(
+                "SWEBENCH_DATASET_SPLIT", "test"
+            ),
+            swebench_eval_arch=os.getenv(
+                "SWEBENCH_EVAL_ARCH", "x86_64"
+            ),
+            swebench_eval_timeout_seconds=cls._get_int(
+                "SWEBENCH_EVAL_TIMEOUT_SECONDS",
+                1800,
+            ),
+            swebench_eval_image_template=os.getenv(
+                "SWEBENCH_EVAL_IMAGE_TEMPLATE",
+                "ghcr.io/epoch-research/swe-bench.eval.{arch}.{instance_id}",
+            ),
+            swebench_eval_model_name=os.getenv(
+                "SWEBENCH_EVAL_MODEL_NAME", "soma-validator"
+            ),
+            swebench_eval_remove_image_after_run=cls._get_bool(
+                "SWEBENCH_EVAL_REMOVE_IMAGE_AFTER_RUN",
+                True,
+            ),
+            swebench_validation_request_path=os.getenv(
+                "SWEBENCH_VALIDATION_REQUEST_PATH",
+                "/validator/get_swebench_validation",
+            ),
+            swebench_validation_submit_path=os.getenv(
+                "SWEBENCH_VALIDATION_SUBMIT_PATH",
+                "/validator/submit_swebench_validation_score",
+            ),
         )
         return settings
 
@@ -140,6 +169,19 @@ class Settings(BaseModel):
             return float(raw)
         except ValueError:
             return default
+
+    @classmethod
+    def _get_bool(cls, name: str, default: bool) -> bool:
+        raw = os.getenv(name)
+        if raw is None or raw == "":
+            return default
+
+        normalized = raw.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+        return default
 
     @classmethod
     def _require_non_empty(cls, name: str, value: str) -> str:

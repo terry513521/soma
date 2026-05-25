@@ -1,0 +1,207 @@
+from __future__ import annotations
+
+from sqlalchemy import select, text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from fastapi import APIRouter, Depends, Request
+
+from soma_shared.contracts.sandbox.v1.messages import (
+    CompactBenchReportRequest,
+    CompactBenchReportResponse,
+)
+from soma_shared.db.models import SweBenchRun
+from soma_shared.db.session import get_db_session
+
+from app.api.routes.utils import _require_private_network
+from app.core.logging import get_logger
+from app.services.blob.patch_artifact_storage import PatchArtifactStorage
+from app.services.blob.s3 import S3BlobStorage
+
+
+logger = get_logger(__name__)
+
+
+router = APIRouter(
+    prefix="/api/private/sandbox",
+    tags=["sandbox"],
+)
+
+
+def _model_attr(model: type, name: str):
+    try:
+        return getattr(model, name)
+    except AttributeError:
+        return None
+
+
+def _get_s3_storage(app) -> S3BlobStorage:
+    s3_storage = getattr(app.state, "swebench_s3_storage", None)
+    if s3_storage is None:
+        s3_storage = S3BlobStorage()
+        app.state.swebench_s3_storage = s3_storage
+    return s3_storage
+
+
+def _get_output_storage(app) -> PatchArtifactStorage:
+    output_storage = getattr(app.state, "swebench_output_storage", None)
+    if output_storage is None:
+        output_storage = PatchArtifactStorage(_get_s3_storage(app))
+        app.state.swebench_output_storage = output_storage
+    return output_storage
+
+
+def _extract_compact_bench_error(payload: CompactBenchReportRequest) -> str | None:
+    if payload.error and payload.error.strip():
+        return payload.error.strip()
+
+    metadata = payload.metadata or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    candidates = [
+        "error",
+        "task_error",
+        "runtime_error",
+        "failure_reason",
+        "reason",
+        "exception",
+        "stderr",
+    ]
+    for key in candidates:
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    result = metadata.get("result")
+    if isinstance(result, dict):
+        for key in candidates:
+            value = result.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+    return None
+
+
+async def _persist_compact_bench_report(
+    db: AsyncSession,
+    *,
+    payload: CompactBenchReportRequest,
+    request: Request,
+) -> bool:
+    run = (
+        await db.execute(
+            select(SweBenchRun).where(SweBenchRun.id == payload.run_id)
+        )
+    ).scalar_one_or_none()
+    if run is None:
+        logger.warning(
+            "compact_bench_report_run_missing",
+            extra={
+                "run_id": payload.run_id,
+            },
+        )
+        # Acknowledge orphaned callbacks to avoid endless retries in sandbox
+        # after data resets / test cleanups on platform side.
+        return True
+
+    patch_save_error: str | None = None
+    patch_saved = False
+    if payload.patch_diff is not None:
+        try:
+            output_storage = _get_output_storage(request.app)
+            await output_storage.save_single(run.diff_storage_uuid, payload.patch_diff)
+            patch_saved = True
+        except Exception as exc:
+            patch_save_error = str(exc)
+            logger.exception(
+                "compact_bench_report_patch_save_failed",
+                extra={
+                    "run_id": payload.run_id,
+                    "storage_uuid": run.diff_storage_uuid,
+                    "request_path": str(request.url.path),
+                },
+            )
+
+    run.agent_steps = payload.agent_steps
+    run.tokens_used = payload.total_tokens
+    run.time_taken_seconds = payload.execution_time_seconds
+    extracted_error = _extract_compact_bench_error(payload)
+    desired_status = "completed" if (payload.ok_status and payload.patch_capture_status) else "failed"
+    if patch_save_error:
+        if extracted_error:
+            resolved_last_error = f"{extracted_error}; patch save failed: {patch_save_error}"
+        else:
+            resolved_last_error = f"patch save failed: {patch_save_error}"
+    elif desired_status == "failed":
+        resolved_last_error = (
+            extracted_error
+            or (
+                "Sandbox reported run as failed "
+                f"(ok_status={payload.ok_status}, patch_capture_status={payload.patch_capture_status})."
+            )
+        )
+    else:
+        resolved_last_error = extracted_error
+
+    last_error_col = _model_attr(SweBenchRun, "last_error")
+    if last_error_col is not None:
+        run.last_error = resolved_last_error
+    else:
+        # Backward compatibility when ORM model doesn't expose `last_error`,
+        # but the DB table still has this column.
+        await db.execute(
+            text("UPDATE swe_bench_runs SET last_error = :last_error, updated_at = now() WHERE id = :run_id"),
+            {"last_error": resolved_last_error, "run_id": int(payload.run_id)},
+        )
+
+    # Compatible with both old/new soma_shared branches.
+    status_col = _model_attr(SweBenchRun, "status")
+    if status_col is not None:
+        run.status = desired_status
+    else:
+        # Backward compatibility when ORM model doesn't expose `status`,
+        # but the DB table still has this column.
+        await db.execute(
+            text("UPDATE swe_bench_runs SET status = :status, updated_at = now() WHERE id = :run_id"),
+            {"status": desired_status, "run_id": int(payload.run_id)},
+        )
+
+    await db.commit()
+    logger.info(
+        "compact_bench_report_persisted",
+        extra={
+            "run_id": payload.run_id,
+            "ok_status": payload.ok_status,
+            "patch_capture_status": payload.patch_capture_status,
+            "patch_saved": patch_saved,
+            "status": desired_status,
+            "has_error": bool(resolved_last_error),
+            "error_excerpt": (resolved_last_error or "")[:240],
+        },
+    )
+    return True
+
+
+@router.post(
+    "/compact-bench/report",
+    response_model=CompactBenchReportResponse,
+)
+async def report_compact_bench_result(
+    payload: CompactBenchReportRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db_session),
+    _: None = Depends(_require_private_network),
+) -> CompactBenchReportResponse:
+    persisted = False
+    try:
+        persisted = await _persist_compact_bench_report(db, payload=payload, request=request)
+    except Exception:
+        await db.rollback()
+        logger.exception(
+            "compact_bench_report_db_write_failed",
+            extra={
+                "run_id": payload.run_id,
+                "path": str(request.url.path),
+            },
+        )
+    return CompactBenchReportResponse(success=persisted)
