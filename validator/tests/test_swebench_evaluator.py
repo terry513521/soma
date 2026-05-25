@@ -1,3 +1,4 @@
+import logging
 import os
 import sys
 from pathlib import Path
@@ -5,7 +6,9 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import docker
+import httpx
 import pytest
+from huggingface_hub.errors import HfHubHTTPError
 
 
 TESTS_DIR = os.path.dirname(__file__)
@@ -19,8 +22,8 @@ if ROOT_DIR not in sys.path:
 if MCP_PLATFORM_DIR not in sys.path:
     sys.path.insert(0, MCP_PLATFORM_DIR)
 
-from validator.evaluation.evaluator import Evaluator
-from validator.evaluation.swebench_evaluator import SWEBenchContainerEvaluator
+from validator.evaluation.evaluator import BatchScoringError, Evaluator
+from validator.evaluation.swebench_evaluator import SWEBenchContainerEvaluator, SWEBenchEvaluationError
 
 
 def test_empty_diff_returns_zero_without_loading_harness(monkeypatch):
@@ -210,6 +213,66 @@ def test_sync_runner_can_disable_image_cleanup(monkeypatch):
     }
 
 
+def test_sync_runner_quiets_http_probe_logs_only_while_loading_dataset(monkeypatch):
+    evaluator = SWEBenchContainerEvaluator(settings=SimpleNamespace())
+
+    fake_client = SimpleNamespace(close=lambda: None)
+    fake_test_spec = SimpleNamespace(arch="x86_64")
+    observed = {}
+
+    httpx_logger = logging.getLogger("httpx")
+    httpcore_logger = logging.getLogger("httpcore")
+    original_httpx_level = httpx_logger.level
+    original_httpcore_level = httpcore_logger.level
+    httpx_logger.setLevel(logging.INFO)
+    httpcore_logger.setLevel(logging.INFO)
+
+    def fake_load_swebench_dataset(name, split, instance_ids):
+        observed["httpx_effective_level"] = httpx_logger.getEffectiveLevel()
+        observed["httpcore_effective_level"] = httpcore_logger.getEffectiveLevel()
+        return [{"instance_id": instance_ids[0], "repo": "django/django"}]
+
+    def fake_run_instance(
+        test_spec,
+        prediction,
+        rm_image,
+        force_rebuild,
+        client,
+        run_id,
+        timeout,
+        container_kwargs=None,
+    ):
+        return prediction["instance_id"], {
+            prediction["instance_id"]: {"resolved": True}
+        }
+
+    fake_harness = SimpleNamespace(
+        docker=SimpleNamespace(from_env=lambda timeout=600: fake_client),
+        KEY_INSTANCE_ID="instance_id",
+        KEY_MODEL="model_name_or_path",
+        KEY_PREDICTION="model_patch",
+        run_instance=fake_run_instance,
+        make_test_spec=lambda instance, namespace=None, instance_image_tag="latest": fake_test_spec,
+        load_swebench_dataset=fake_load_swebench_dataset,
+    )
+    monkeypatch.setattr(evaluator, "_load_harness_api", lambda: fake_harness)
+
+    try:
+        result = evaluator._evaluate_instance_diff_sync(
+            instance_id="django__django-11119",
+            diff="diff --git a/foo.py b/foo.py\n",
+        )
+
+        assert result.score == 1
+        assert observed["httpx_effective_level"] >= logging.WARNING
+        assert observed["httpcore_effective_level"] >= logging.WARNING
+        assert httpx_logger.level == logging.INFO
+        assert httpcore_logger.level == logging.INFO
+    finally:
+        httpx_logger.setLevel(original_httpx_level)
+        httpcore_logger.setLevel(original_httpcore_level)
+
+
 def test_load_harness_api_requires_installed_package(monkeypatch):
     evaluator = SWEBenchContainerEvaluator(settings=SimpleNamespace())
 
@@ -387,6 +450,47 @@ async def test_evaluator_delegates_swebench_patch_to_runner():
     )
 
     assert result.score == 1
+
+
+@pytest.mark.asyncio
+async def test_evaluator_classifies_hf_429_as_separate_batch_error():
+    evaluator = Evaluator(settings=SimpleNamespace(max_concurrent_evaluations=1))
+
+    async def fake_eval(**kwargs):
+        request = httpx.Request(
+            "GET",
+            "https://huggingface.co/datasets/SWE-bench/SWE-bench_Verified",
+        )
+        response = httpx.Response(
+            429,
+            headers={
+                "retry-after": "12",
+                "x-request-id": "hf-request-123",
+            },
+            request=request,
+        )
+        hf_exc = HfHubHTTPError("429 Too Many Requests", response=response)
+        raise SWEBenchEvaluationError("dataset load failed") from hf_exc
+
+    evaluator.evaluate_swebench_patch = fake_eval
+
+    task = SimpleNamespace(
+        validation_id=123,
+        instance_id="django__django-11119",
+        diff="diff --git a/foo.py b/foo.py\n",
+        arch="x86_64",
+    )
+
+    with pytest.raises(BatchScoringError) as exc_info:
+        await evaluator._evaluate_task(task=task)
+
+    err = exc_info.value
+    assert err.error_code == Evaluator.HF_RATE_LIMIT_ERROR_CODE
+    assert err.retryable is True
+    assert err.details["provider"] == "huggingface"
+    assert err.details["status_code"] == 429
+    assert err.details["retry_after"] == "12"
+    assert err.details["request_id"] == "hf-request-123"
 
 
 @pytest.mark.asyncio

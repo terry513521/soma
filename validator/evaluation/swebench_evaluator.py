@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 import importlib
 import inspect
 import logging
@@ -132,11 +133,12 @@ class SWEBenchContainerEvaluator:
 
         client = None
         try:
-            dataset = harness.load_swebench_dataset(
-                name=dataset_name,
-                split=dataset_split,
-                instance_ids=[normalized_instance_id],
-            )
+            with self._quiet_http_probe_logs():
+                dataset = harness.load_swebench_dataset(
+                    name=dataset_name,
+                    split=dataset_split,
+                    instance_ids=[normalized_instance_id],
+                )
             if not dataset:
                 raise SWEBenchEvaluationError(
                     f"Instance {normalized_instance_id} not found in dataset {dataset_name}:{dataset_split}"
@@ -214,6 +216,21 @@ class SWEBenchContainerEvaluator:
             "security_opt": ["no-new-privileges:true"],
             "pids_limit": DEFAULT_CONTAINER_PIDS_LIMIT,
         }
+
+    @staticmethod
+    @contextmanager
+    def _quiet_http_probe_logs():
+        logger_levels = []
+        for logger_name in ("httpx", "httpcore"):
+            library_logger = logging.getLogger(logger_name)
+            logger_levels.append((library_logger, library_logger.level))
+            library_logger.setLevel(max(library_logger.level, logging.WARNING))
+
+        try:
+            yield
+        finally:
+            for library_logger, level in logger_levels:
+                library_logger.setLevel(level)
 
     @staticmethod
     def _prefer_nonroot_test_execution(test_spec: object) -> None:
