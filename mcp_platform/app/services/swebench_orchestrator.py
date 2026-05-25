@@ -1,0 +1,954 @@
+from __future__ import annotations
+
+import asyncio
+import math
+import random
+import time
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
+
+from sqlalchemy import func, select, text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.config import settings
+from app.core.logging import get_logger
+from app.services.blob.s3 import S3BlobStorage
+from app.services.sandbox.remote_compact_bench_manager import RemoteCompactBenchManager
+from soma_shared.db.models.miner import Miner
+from soma_shared.db.models.miner_upload import MinerUpload
+from soma_shared.db.models.script import Script
+from soma_shared.db.models.swe_bench_run import SweBenchRun
+from soma_shared.db.models.swe_bench_run_validation import SweBenchRunValidation
+from soma_shared.db.models.swe_bench_task import SweBenchTask
+from soma_shared.db.models.competition import Competition
+from soma_shared.db.models.competition_config import CompetitionConfig
+from soma_shared.db.models.competition_timeframe import CompetitionTimeframe
+from soma_shared.db.session import get_db_session, get_engine
+
+
+logger = get_logger(__name__)
+
+_ORCHESTRATOR_LOCK_KEY = "swebench-orchestrator-v1"
+_SEED_IDLE_LOG_INTERVAL_SECONDS = 60
+_LAST_IDLE_SEED_LOG_AT: datetime | None = None
+_LAST_CAPACITY_LOG_AT: float | None = None
+_CAPACITY_LOG_INTERVAL_SECONDS = 30.0
+_LAST_IDLE_DISPATCH_LOG_AT: float | None = None
+_DISPATCH_IDLE_LOG_INTERVAL_SECONDS = 30.0
+
+
+@dataclass(frozen=True)
+class _ScriptRef:
+    script_id: int
+    miner_fk: int
+
+
+def start_swebench_orchestrator_task(app) -> None:
+    interval = max(0.5, float(settings.swebench_orchestrator_interval_seconds))
+    task = asyncio.create_task(_run_orchestrator_loop(app, interval))
+    app.state.swebench_orchestrator_task = task
+    logger.info(
+        "swebench_orchestrator_started",
+        extra={
+            "interval_seconds": interval,
+            "dispatch_batch_size": int(settings.swebench_dispatch_batch_size),
+        },
+    )
+
+
+async def stop_swebench_orchestrator_task(app) -> None:
+    task = getattr(app.state, "swebench_orchestrator_task", None)
+    if task is None:
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    logger.info("swebench_orchestrator_stopped")
+
+
+async def _run_orchestrator_loop(app, interval_seconds: float) -> None:
+    try:
+        while True:
+            try:
+                await _run_orchestration_tick(app)
+            except Exception:
+                logger.exception("swebench_orchestration_tick_failed")
+            await asyncio.sleep(interval_seconds)
+    except asyncio.CancelledError:
+        logger.info("swebench_orchestrator_cancelled")
+
+
+async def _run_orchestration_tick(app) -> None:
+    global _LAST_IDLE_DISPATCH_LOG_AT
+
+    lock_conn = None
+    lock_acquired = False
+    try:
+        engine = get_engine()
+        lock_conn = await engine.connect()
+        if lock_conn.dialect.name == "postgresql":
+            lock_acquired = bool(
+                (
+                    await lock_conn.execute(
+                        text("SELECT pg_try_advisory_lock(hashtext(:lock_key))"),
+                        {"lock_key": _ORCHESTRATOR_LOCK_KEY},
+                    )
+                ).scalar()
+            )
+            if not lock_acquired:
+                return
+
+        now = datetime.now(timezone.utc)
+
+        async for db in get_db_session():
+            active_competition_ids = await _get_active_competition_ids(db, now)
+            seeded_runs = 0
+            for competition_id in active_competition_ids:
+                seeded_runs += await _seed_runs_for_competition(db, competition_id, now)
+            await db.commit()
+            _maybe_log_seed_pass(
+                active_competitions=len(active_competition_ids),
+                seeded_runs=seeded_runs,
+                now=now,
+            )
+            break
+
+        dispatched, deferred, failed = await _dispatch_due_runs(app, now)
+        if dispatched or failed:
+            logger.info(
+                "swebench_orchestrator_dispatch_pass",
+                extra={
+                    "dispatched": dispatched,
+                    "deferred": deferred,
+                    "failed": failed,
+                },
+            )
+            _LAST_IDLE_DISPATCH_LOG_AT = None
+        elif deferred:
+            now_monotonic = time.monotonic()
+            if (
+                _LAST_IDLE_DISPATCH_LOG_AT is None
+                or (now_monotonic - _LAST_IDLE_DISPATCH_LOG_AT) >= _DISPATCH_IDLE_LOG_INTERVAL_SECONDS
+            ):
+                logger.info(
+                    "swebench_orchestrator_dispatch_pass_idle",
+                    extra={
+                        "dispatched": dispatched,
+                        "deferred": deferred,
+                        "failed": failed,
+                        "interval_seconds": _DISPATCH_IDLE_LOG_INTERVAL_SECONDS,
+                    },
+                )
+                _LAST_IDLE_DISPATCH_LOG_AT = now_monotonic
+    finally:
+        if lock_conn is not None:
+            try:
+                if lock_acquired:
+                    await lock_conn.execute(
+                        text("SELECT pg_advisory_unlock(hashtext(:lock_key))"),
+                        {"lock_key": _ORCHESTRATOR_LOCK_KEY},
+                    )
+            finally:
+                await lock_conn.close()
+
+
+def _maybe_log_seed_pass(*, active_competitions: int, seeded_runs: int, now: datetime) -> None:
+    global _LAST_IDLE_SEED_LOG_AT
+
+    # Log immediately only when new runs were seeded.
+    # Otherwise throttle to keep orchestrator logs readable.
+    if seeded_runs > 0:
+        logger.info(
+            "swebench_orchestrator_seed_pass",
+            extra={
+                "active_competitions": active_competitions,
+                "seeded_runs": seeded_runs,
+            },
+        )
+        _LAST_IDLE_SEED_LOG_AT = None
+        return
+
+    if _LAST_IDLE_SEED_LOG_AT is None:
+        should_log_idle = True
+    else:
+        elapsed_seconds = (now - _LAST_IDLE_SEED_LOG_AT).total_seconds()
+        should_log_idle = elapsed_seconds >= _SEED_IDLE_LOG_INTERVAL_SECONDS
+
+    if should_log_idle:
+        logger.info(
+            (
+                "swebench_orchestrator_seed_pass_idle"
+                if active_competitions == 0
+                else "swebench_orchestrator_seed_pass_noop"
+            ),
+            extra={
+                "active_competitions": active_competitions,
+                "seeded_runs": seeded_runs,
+                "interval_seconds": _SEED_IDLE_LOG_INTERVAL_SECONDS,
+            },
+        )
+        _LAST_IDLE_SEED_LOG_AT = now
+
+
+async def _get_active_competition_ids(db: AsyncSession, now: datetime) -> list[int]:
+    rows = (
+        await db.execute(
+            select(Competition.id)
+            .join(CompetitionConfig, CompetitionConfig.competition_fk == Competition.id)
+            .join(
+                CompetitionTimeframe,
+                CompetitionTimeframe.competition_config_fk == CompetitionConfig.id,
+            )
+            .where(CompetitionConfig.is_active.is_(True))
+            .where(CompetitionTimeframe.upload_starts_at <= now)
+            .where(CompetitionTimeframe.eval_ends_at >= now)
+        )
+    ).all()
+    return [int(row[0]) for row in rows]
+
+
+async def _seed_runs_for_competition(
+    db: AsyncSession,
+    competition_id: int,
+    now: datetime,
+) -> int:
+    tasks = (
+        (
+            await db.execute(
+                select(SweBenchTask)
+                .where(SweBenchTask.competition_fk == competition_id)
+                .order_by(SweBenchTask.id.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not tasks:
+        return 0
+
+    task_repeats: dict[int, int] = {
+        int(task.id): max(1, int(task.planned_repeats or 1)) for task in tasks
+    }
+    screener_task_count = sum(1 for task in tasks if bool(task.is_screener))
+
+    created = 0
+    created += await _seed_baseline_runs(
+        db,
+        tasks=tasks,
+        task_repeats=task_repeats,
+        now=now,
+    )
+
+    baseline_complete = await _is_baseline_evaluation_complete(
+        db,
+        task_ids=[int(task.id) for task in tasks],
+        task_repeats=task_repeats,
+    )
+    if not baseline_complete:
+        return created
+
+    if screener_task_count > 0 and not await _competition_has_non_baseline_runs(
+        db,
+        competition_id=competition_id,
+    ):
+        await _select_dynamic_screener_tasks(
+            db,
+            tasks=tasks,
+            task_repeats=task_repeats,
+            screener_task_count=screener_task_count,
+        )
+
+    screener_task_ids = [int(task.id) for task in tasks if bool(task.is_screener)]
+
+    scripts = await _load_latest_scripts_for_competition(db, competition_id)
+    for script in scripts:
+        created += await _seed_script_runs(
+            db,
+            script=script,
+            tasks=tasks,
+            task_repeats=task_repeats,
+            screener_task_ids=screener_task_ids,
+            now=now,
+        )
+
+    return created
+
+
+async def _competition_has_non_baseline_runs(
+    db: AsyncSession,
+    *,
+    competition_id: int,
+) -> bool:
+    row = (
+        await db.execute(
+            text(
+                """
+                SELECT 1
+                FROM swe_bench_runs r
+                JOIN swe_bench_tasks t ON t.id = r.task_fk
+                WHERE t.competition_fk = :competition_id
+                  AND r.baseline_run = FALSE
+                LIMIT 1
+                """
+            ),
+            {"competition_id": int(competition_id)},
+        )
+    ).first()
+    return row is not None
+
+
+async def _is_baseline_evaluation_complete(
+    db: AsyncSession,
+    *,
+    task_ids: list[int],
+    task_repeats: dict[int, int],
+) -> bool:
+    if not task_ids:
+        return False
+
+    expected_runs = sum(max(1, int(task_repeats.get(task_id, 1))) for task_id in task_ids)
+    evaluated_runs = int(
+        (
+            await db.execute(
+                select(func.count(func.distinct(SweBenchRun.id)))
+                .join(SweBenchRunValidation, SweBenchRunValidation.run_fk == SweBenchRun.id)
+                .where(SweBenchRun.baseline_run.is_(True))
+                .where(SweBenchRun.task_fk.in_(task_ids))
+                .where(SweBenchRunValidation.scored_at.is_not(None))
+                .where(SweBenchRunValidation.resolved.is_not(None))
+            )
+        ).scalar()
+        or 0
+    )
+    return evaluated_runs >= expected_runs
+
+
+async def _select_dynamic_screener_tasks(
+    db: AsyncSession,
+    *,
+    tasks: list[SweBenchTask],
+    task_repeats: dict[int, int],
+    screener_task_count: int,
+) -> None:
+    if screener_task_count <= 0 or not tasks:
+        return
+
+    task_ids = [int(task.id) for task in tasks]
+    rows = (
+        await db.execute(
+            select(
+                SweBenchRun.task_fk,
+                SweBenchRunValidation.resolved,
+            )
+            .join(SweBenchRunValidation, SweBenchRunValidation.run_fk == SweBenchRun.id)
+            .where(SweBenchRun.baseline_run.is_(True))
+            .where(SweBenchRun.task_fk.in_(task_ids))
+            .where(SweBenchRunValidation.scored_at.is_not(None))
+            .where(SweBenchRunValidation.resolved.is_not(None))
+        )
+    ).all()
+
+    success_counts: dict[int, int] = {task_id: 0 for task_id in task_ids}
+    for task_fk, resolved in rows:
+        task_id = int(task_fk)
+        if bool(resolved):
+            success_counts[task_id] = success_counts.get(task_id, 0) + 1
+
+    by_success: dict[int, list[int]] = {}
+    for task_id in task_ids:
+        score = int(success_counts.get(task_id, 0))
+        by_success.setdefault(score, []).append(task_id)
+
+    selected: list[int] = []
+    for score in sorted(by_success.keys(), reverse=True):
+        candidates = by_success[score]
+        random.shuffle(candidates)
+        remaining = screener_task_count - len(selected)
+        if remaining <= 0:
+            break
+        selected.extend(candidates[:remaining])
+
+    selected_set = set(selected[:screener_task_count])
+    for task in tasks:
+        task.is_screener = int(task.id) in selected_set
+
+    logger.info(
+        "swebench_dynamic_screener_tasks_selected",
+        extra={
+            "task_ids": sorted(task_ids),
+            "selected_screener_task_ids": sorted(selected_set),
+            "requested_screener_task_count": int(screener_task_count),
+            "success_counts": {str(task_id): int(success_counts.get(task_id, 0)) for task_id in task_ids},
+        },
+    )
+
+
+async def _load_latest_scripts_for_competition(
+    db: AsyncSession,
+    competition_id: int,
+) -> list[_ScriptRef]:
+    rows = (
+        await db.execute(
+            select(
+                Script.id,
+                Script.miner_fk,
+                MinerUpload.created_at,
+            )
+            .join(MinerUpload, MinerUpload.script_fk == Script.id)
+            .join(Miner, Miner.id == Script.miner_fk)
+            .where(MinerUpload.competition_fk == competition_id)
+            .where(Miner.miner_banned_status.is_(False))
+            .order_by(MinerUpload.created_at.desc())
+        )
+    ).all()
+
+    by_miner: dict[int, _ScriptRef] = {}
+    for row in rows:
+        script_id = int(row[0])
+        miner_fk = int(row[1])
+        if miner_fk in by_miner:
+            continue
+        by_miner[miner_fk] = _ScriptRef(script_id=script_id, miner_fk=miner_fk)
+    return list(by_miner.values())
+
+
+async def _seed_baseline_runs(
+    db: AsyncSession,
+    *,
+    tasks: list[SweBenchTask],
+    task_repeats: dict[int, int],
+    now: datetime,
+) -> int:
+    task_ids = [int(task.id) for task in tasks]
+    existing = set(
+        (
+            int(row[0]),
+            int(row[1]),
+        )
+        for row in (
+            await db.execute(
+                select(SweBenchRun.task_fk, SweBenchRun.attempt_no)
+                .where(SweBenchRun.baseline_run.is_(True))
+                .where(SweBenchRun.miner_fk.is_(None))
+                .where(SweBenchRun.script_fk.is_(None))
+                .where(SweBenchRun.task_fk.in_(task_ids))
+            )
+        ).all()
+    )
+
+    created = 0
+    for task in tasks:
+        task_id = int(task.id)
+        for attempt_no in range(1, task_repeats[task_id] + 1):
+            key = (task_id, attempt_no)
+            if key in existing:
+                continue
+            await _create_run_and_validation(
+                db,
+                task_fk=task_id,
+                attempt_no=attempt_no,
+                baseline_run=True,
+                miner_fk=None,
+                script_fk=None,
+                now=now,
+            )
+            existing.add(key)
+            created += 1
+    return created
+
+
+async def _seed_script_runs(
+    db: AsyncSession,
+    *,
+    script: _ScriptRef,
+    tasks: list[SweBenchTask],
+    task_repeats: dict[int, int],
+    screener_task_ids: list[int],
+    now: datetime,
+) -> int:
+    created = 0
+
+    if screener_task_ids:
+        created += await _seed_script_task_subset(
+            db,
+            script=script,
+            task_ids=screener_task_ids,
+            task_repeats=task_repeats,
+            now=now,
+        )
+
+    screening_complete, screening_passed = await _evaluate_screening_for_script(
+        db,
+        script=script,
+        screener_task_ids=screener_task_ids,
+        task_repeats=task_repeats,
+    )
+
+    if not screening_complete or not screening_passed:
+        return created
+
+    all_task_ids = [int(task.id) for task in tasks]
+    created += await _seed_script_task_subset(
+        db,
+        script=script,
+        task_ids=all_task_ids,
+        task_repeats=task_repeats,
+        now=now,
+    )
+    return created
+
+
+async def _seed_script_task_subset(
+    db: AsyncSession,
+    *,
+    script: _ScriptRef,
+    task_ids: list[int],
+    task_repeats: dict[int, int],
+    now: datetime,
+) -> int:
+    if not task_ids:
+        return 0
+
+    existing = set(
+        (
+            int(row[0]),
+            int(row[1]),
+        )
+        for row in (
+            await db.execute(
+                select(SweBenchRun.task_fk, SweBenchRun.attempt_no)
+                .where(SweBenchRun.baseline_run.is_(False))
+                .where(SweBenchRun.script_fk == script.script_id)
+                .where(SweBenchRun.miner_fk == script.miner_fk)
+                .where(SweBenchRun.task_fk.in_(task_ids))
+            )
+        ).all()
+    )
+
+    created = 0
+    for task_id in task_ids:
+        repeats = max(1, int(task_repeats.get(int(task_id), 1)))
+        for attempt_no in range(1, repeats + 1):
+            key = (int(task_id), attempt_no)
+            if key in existing:
+                continue
+            await _create_run_and_validation(
+                db,
+                task_fk=int(task_id),
+                attempt_no=attempt_no,
+                baseline_run=False,
+                miner_fk=script.miner_fk,
+                script_fk=script.script_id,
+                now=now,
+            )
+            existing.add(key)
+            created += 1
+    return created
+
+
+async def _evaluate_screening_for_script(
+    db: AsyncSession,
+    *,
+    script: _ScriptRef,
+    screener_task_ids: list[int],
+    task_repeats: dict[int, int],
+) -> tuple[bool, bool]:
+    if not screener_task_ids:
+        return True, True
+
+    rows = (
+        await db.execute(
+            select(
+                SweBenchRun.task_fk,
+                SweBenchRun.attempt_no,
+                SweBenchRunValidation.resolved,
+                SweBenchRunValidation.scored_at,
+            )
+            .join(
+                SweBenchRunValidation,
+                SweBenchRunValidation.run_fk == SweBenchRun.id,
+            )
+            .where(SweBenchRun.baseline_run.is_(False))
+            .where(SweBenchRun.script_fk == script.script_id)
+            .where(SweBenchRun.miner_fk == script.miner_fk)
+            .where(SweBenchRun.task_fk.in_(screener_task_ids))
+        )
+    ).all()
+
+    by_task_attempt: dict[tuple[int, int], tuple[bool | None, datetime | None]] = {}
+    for row in rows:
+        by_task_attempt[(int(row[0]), int(row[1]))] = (row[2], row[3])
+
+    passed_task_count = 0
+    for task_id in screener_task_ids:
+        repeats = max(1, int(task_repeats.get(int(task_id), 1)))
+        attempt_resolved: list[bool] = []
+        for attempt_no in range(1, repeats + 1):
+            state = by_task_attempt.get((int(task_id), attempt_no))
+            if state is None:
+                return False, False
+            resolved_value, scored_at = state
+            if scored_at is None or resolved_value is None:
+                return False, False
+            attempt_resolved.append(bool(resolved_value))
+
+        if sum(1 for value in attempt_resolved if value) > (len(attempt_resolved) // 2):
+            passed_task_count += 1
+
+    required_passes = _required_screening_task_passes(len(screener_task_ids))
+    return True, passed_task_count >= required_passes
+
+
+def _required_screening_task_passes(total_screener_tasks: int) -> int:
+    if total_screener_tasks <= 0:
+        return 0
+
+    ratio = float(settings.swebench_screening_pass_ratio)
+    ratio = min(1.0, max(0.0, ratio))
+    ratio_required = int(math.ceil(total_screener_tasks * ratio))
+    min_required = max(0, int(settings.swebench_screening_min_passed_tasks))
+
+    required = max(ratio_required, min_required)
+    required = max(1, required)
+    return min(total_screener_tasks, required)
+
+
+async def _create_run_and_validation(
+    db: AsyncSession,
+    *,
+    task_fk: int,
+    attempt_no: int,
+    baseline_run: bool,
+    miner_fk: int | None,
+    script_fk: int | None,
+    now: datetime,
+) -> None:
+    run = SweBenchRun(
+        task_fk=task_fk,
+        request_fk=None,
+        attempt_no=attempt_no,
+        miner_fk=miner_fk,
+        script_fk=script_fk,
+        diff_storage_uuid=str(uuid.uuid4()),
+        tokens_used=None,
+        time_taken_seconds=None,
+        agent_steps=None,
+        baseline_run=baseline_run,
+    )
+    db.add(run)
+    await db.flush()
+
+    validation = SweBenchRunValidation(
+        run_fk=run.id,
+        request_fk=None,
+        validator_fk=None,
+        resolved=None,
+        scored_at=None,
+    )
+    db.add(validation)
+
+
+async def _dispatch_due_runs(
+    app,
+    now: datetime,
+) -> tuple[int, int, int]:
+    global _LAST_CAPACITY_LOG_AT
+
+    manager = _get_compact_bench_manager(app)
+    s3_storage = _get_s3_storage(app)
+
+    dispatched = 0
+    deferred = 0
+    failed = 0
+
+    retry_not_before: dict[int, float] = getattr(app.state, "swebench_retry_not_before", {})
+    retry_attempts: dict[int, int] = getattr(app.state, "swebench_retry_attempts", {})
+    global_not_before: float = float(getattr(app.state, "swebench_global_retry_not_before", 0.0))
+    app.state.swebench_retry_not_before = retry_not_before
+    app.state.swebench_retry_attempts = retry_attempts
+
+    async for db in get_db_session():
+        batch_size = max(1, int(settings.swebench_dispatch_batch_size))
+        fetch_limit = min(200, batch_size * 5)
+        due_rows = (
+            await db.execute(
+                text(
+                    """
+                    SELECT
+                        r.id AS run_id,
+                        r.diff_storage_uuid,
+                        r.attempt_no,
+                        r.miner_fk,
+                        r.script_fk,
+                        r.baseline_run,
+                        t.id AS task_id,
+                        t.competition_fk,
+                        t.instance_id,
+                        t.planned_repeats,
+                        t.is_screener
+                    FROM swe_bench_runs r
+                    JOIN swe_bench_tasks t ON t.id = r.task_fk
+                    WHERE r.status = 'pending'
+                    ORDER BY r.created_at ASC
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT :limit
+                    """
+                ),
+                {"limit": fetch_limit},
+            )
+        ).mappings().all()
+
+        if not due_rows:
+            await db.rollback()
+            break
+
+        now_monotonic = time.monotonic()
+        if global_not_before > now_monotonic:
+            deferred += len(due_rows)
+            await db.rollback()
+            if (
+                _LAST_CAPACITY_LOG_AT is None
+                or (now_monotonic - _LAST_CAPACITY_LOG_AT) >= _CAPACITY_LOG_INTERVAL_SECONDS
+            ):
+                _LAST_CAPACITY_LOG_AT = now_monotonic
+                logger.info(
+                    "swebench_orchestrator_capacity_cooldown_active",
+                    extra={
+                        "cooldown_seconds_left": round(global_not_before - now_monotonic, 2),
+                        "deferred_runs": len(due_rows),
+                    },
+                )
+            break
+
+        dispatch_rows: list[dict] = []
+        deferred_by_cooldown = 0
+        for row in due_rows:
+            run_id = int(row["run_id"])
+            retry_at = retry_not_before.get(run_id)
+            if retry_at is not None and retry_at > now_monotonic:
+                deferred_by_cooldown += 1
+                continue
+            dispatch_rows.append(row)
+            if len(dispatch_rows) >= batch_size:
+                break
+
+        if not dispatch_rows:
+            deferred += deferred_by_cooldown
+            await db.rollback()
+            break
+
+        expires_in = int(max(60.0, float(settings.sandbox_timeout_per_task_seconds) + 300.0))
+
+        for row in dispatch_rows:
+            run_id = int(row["run_id"])
+            script_presigned_url = await _resolve_script_presigned_url(
+                db=db,
+                app=app,
+                s3_storage=s3_storage,
+                expires_in=expires_in,
+                script_fk=row.get("script_fk"),
+                miner_fk=row.get("miner_fk"),
+                baseline_run=bool(row["baseline_run"]),
+            )
+
+            ok, error, retryable = await manager.dispatch_swebench_run(
+                run_id=run_id,
+                benchmark=str(settings.swebench_benchmark_name),
+                instance_id=str(row["instance_id"]),
+                storage_uuid=str(row["diff_storage_uuid"]),
+                script_presigned_url=script_presigned_url,
+                task_context={
+                    "competition_fk": int(row["competition_fk"]),
+                    "miner_fk": row["miner_fk"],
+                    "script_fk": row["script_fk"],
+                    "attempt_no": int(row["attempt_no"]),
+                    "planned_repeats": int(row["planned_repeats"]),
+                    "baseline_run": bool(row["baseline_run"]),
+                    "is_screener": bool(row["is_screener"]),
+                },
+            )
+
+            if ok:
+                await db.execute(
+                    text(
+                        "UPDATE swe_bench_runs SET status = 'dispatched', last_error = NULL, updated_at = now() WHERE id = :run_id"
+                    ),
+                    {"run_id": run_id},
+                )
+                dispatched += 1
+                retry_not_before.pop(run_id, None)
+                retry_attempts.pop(run_id, None)
+                continue
+
+            if retryable:
+                attempt = retry_attempts.get(run_id, 0) + 1
+                retry_attempts[run_id] = attempt
+                base = max(0.1, float(settings.swebench_retry_base_seconds))
+                max_seconds = max(base, float(settings.swebench_retry_max_seconds))
+                jitter = max(0.0, float(settings.swebench_retry_jitter_seconds))
+                backoff_seconds = min(max_seconds, base * (2 ** max(0, attempt - 1)))
+                if jitter > 0:
+                    backoff_seconds += random.uniform(0.0, jitter)
+                retry_not_before[run_id] = time.monotonic() + backoff_seconds
+
+                # Keep run pending; orchestrator will retry in next polling tick.
+                await db.execute(
+                    text(
+                        "UPDATE swe_bench_runs SET status = 'pending', last_error = :error, updated_at = now() WHERE id = :run_id"
+                    ),
+                    {"run_id": run_id, "error": error},
+                )
+                deferred += 1
+
+                is_capacity_error = bool(error) and "at capacity" in error.lower()
+                if is_capacity_error:
+                    cooldown_seconds = min(max_seconds, base + (random.uniform(0.0, jitter) if jitter > 0 else 0.0))
+                    app.state.swebench_global_retry_not_before = time.monotonic() + cooldown_seconds
+                    break
+            else:
+                retry_not_before.pop(run_id, None)
+                retry_attempts.pop(run_id, None)
+                await db.execute(
+                    text(
+                        "UPDATE swe_bench_runs SET status = 'failed', last_error = :error, updated_at = now() WHERE id = :run_id"
+                    ),
+                    {"run_id": run_id, "error": error},
+                )
+                failed += 1
+
+        deferred += deferred_by_cooldown
+        await db.commit()
+        break
+
+    return dispatched, deferred, failed
+
+
+async def _resolve_script_presigned_url(
+    *,
+    db: AsyncSession,
+    app,
+    s3_storage: S3BlobStorage,
+    expires_in: int,
+    script_fk,
+    miner_fk,
+    baseline_run: bool,
+) -> str:
+    script_context = await _load_script_dispatch_context(
+        db=db,
+        script_fk=script_fk,
+        miner_fk=miner_fk,
+    )
+    if script_context is not None:
+        script_uuid, script_created_at, miner_ss58 = script_context
+        date_prefix = (
+            script_created_at.strftime("%Y-%m-%d")
+            if script_created_at is not None
+            else None
+        )
+        key = f"hot/miner_solutions/{miner_ss58}"
+        if date_prefix:
+            key = f"{key}/{date_prefix}"
+        key = f"{key}/{script_uuid}.py"
+        return await s3_storage.generate_presigned_url(
+            key,
+            "get_object",
+            expires_in=expires_in,
+        )
+    return await _get_baseline_script_presigned_url(
+        app=app,
+        s3_storage=s3_storage,
+        expires_in=expires_in,
+        baseline_run=baseline_run,
+    )
+
+
+async def _get_baseline_script_presigned_url(
+    *,
+    app,
+    s3_storage: S3BlobStorage,
+    expires_in: int,
+    baseline_run: bool,
+) -> str:
+    key = getattr(app.state, "swebench_baseline_script_key", None)
+    if not key:
+        key = "hot/miner_solutions/__baseline__/baseline_default.py"
+        script = (
+            "from typing import Optional\n\n"
+            "def main(task: str, compression_ratio: Optional[float]) -> str:\n"
+            "    return task or ''\n"
+        )
+        await s3_storage.put_bytes(
+            key,
+            script.encode("utf-8"),
+            content_type="text/x-python",
+        )
+        app.state.swebench_baseline_script_key = key
+
+    if not baseline_run:
+        logger.warning(
+            "swebench_missing_miner_script_fallback_used",
+            extra={"baseline_run": baseline_run},
+        )
+    return await s3_storage.generate_presigned_url(
+        key,
+        "get_object",
+        expires_in=expires_in,
+    )
+
+
+async def _load_script_dispatch_context(
+    *,
+    db: AsyncSession,
+    script_fk,
+    miner_fk,
+) -> tuple[str, datetime | None, str] | None:
+    if not script_fk or not miner_fk:
+        return None
+
+    row = (
+        await db.execute(
+            text(
+                """
+                SELECT s.script_uuid, s.created_at, m.ss58
+                FROM scripts s
+                JOIN miners m ON m.id = s.miner_fk
+                WHERE s.id = :script_fk
+                  AND m.id = :miner_fk
+                LIMIT 1
+                """
+            ),
+            {"script_fk": int(script_fk), "miner_fk": int(miner_fk)},
+        )
+    ).first()
+    if not row:
+        return None
+    return str(row[0]), row[1], str(row[2])
+
+
+def _get_s3_storage(app) -> S3BlobStorage:
+    s3_storage = getattr(app.state, "swebench_s3_storage", None)
+    if s3_storage is None:
+        s3_storage = S3BlobStorage()
+        app.state.swebench_s3_storage = s3_storage
+    return s3_storage
+
+
+def _get_compact_bench_manager(app) -> RemoteCompactBenchManager:
+    manager = getattr(app.state, "swebench_compact_bench_manager", None)
+    if manager is None:
+        service_url = settings.compact_bench_service_url or settings.sandbox_service_url
+        if not service_url:
+            raise RuntimeError(
+                "COMPACT_BENCH_SERVICE_URL or SANDBOX_SERVICE_URL must be set in configuration"
+            )
+        manager = RemoteCompactBenchManager(
+            sandbox_service_url=service_url,
+            execution_timeout_seconds=settings.sandbox_timeout_per_task_seconds,
+            submission_timeout_seconds=settings.sandbox_submission_timeout_seconds,
+            default_model=settings.swebench_default_model,
+        )
+        app.state.swebench_compact_bench_manager = manager
+    return manager
