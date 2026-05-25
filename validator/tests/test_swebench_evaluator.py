@@ -273,6 +273,41 @@ def test_sync_runner_quiets_http_probe_logs_only_while_loading_dataset(monkeypat
         httpcore_logger.setLevel(original_httpcore_level)
 
 
+def test_http_probe_log_quieting_handles_overlapping_contexts():
+    httpx_logger = logging.getLogger("httpx")
+    httpcore_logger = logging.getLogger("httpcore")
+    original_httpx_level = httpx_logger.level
+    original_httpcore_level = httpcore_logger.level
+    httpx_logger.setLevel(logging.INFO)
+    httpcore_logger.setLevel(logging.INFO)
+
+    first_context = SWEBenchContainerEvaluator._quiet_http_probe_logs()
+    second_context = SWEBenchContainerEvaluator._quiet_http_probe_logs()
+
+    try:
+        first_context.__enter__()
+        assert httpx_logger.level == logging.WARNING
+        assert httpcore_logger.level == logging.WARNING
+
+        second_context.__enter__()
+        assert httpx_logger.level == logging.WARNING
+        assert httpcore_logger.level == logging.WARNING
+
+        first_context.__exit__(None, None, None)
+        assert httpx_logger.level == logging.WARNING
+        assert httpcore_logger.level == logging.WARNING
+
+        second_context.__exit__(None, None, None)
+        assert httpx_logger.level == logging.INFO
+        assert httpcore_logger.level == logging.INFO
+    finally:
+        with SWEBenchContainerEvaluator._http_probe_log_lock:
+            SWEBenchContainerEvaluator._http_probe_log_active_count = 0
+            SWEBenchContainerEvaluator._http_probe_log_original_levels = {}
+        httpx_logger.setLevel(original_httpx_level)
+        httpcore_logger.setLevel(original_httpcore_level)
+
+
 def test_load_harness_api_requires_installed_package(monkeypatch):
     evaluator = SWEBenchContainerEvaluator(settings=SimpleNamespace())
 
