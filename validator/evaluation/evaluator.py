@@ -24,6 +24,8 @@ class BatchScoringError(RuntimeError):
 
 
 class Evaluator:
+    HF_RATE_LIMIT_ERROR_CODE = "validator_hf_rate_limited"
+
     def __init__(self, settings=None):
         self.settings = settings
         self._swebench_evaluator = SWEBenchContainerEvaluator(settings=settings)
@@ -100,6 +102,10 @@ class Evaluator:
                 "logs": self._format_logs(result),
             }
         except Exception as exc:
+            error_code, message, details = self._classify_scoring_exception(
+                exc,
+                validation_id=getattr(task, "validation_id", None),
+            )
             logging.error(
                 "Scoring failed for validation_id=%s: %s",
                 getattr(task, "validation_id", None),
@@ -107,13 +113,10 @@ class Evaluator:
                 exc_info=True,
             )
             raise BatchScoringError(
-                error_code="validator_scoring_failed",
-                message=f"Scoring failed for validation_id={getattr(task, 'validation_id', None)}: {exc}",
+                error_code=error_code,
+                message=message,
                 retryable=True,
-                details={
-                    "validation_id": getattr(task, "validation_id", None),
-                    "error": str(exc),
-                },
+                details=details,
             ) from exc
 
     async def evaluate(self, task: SweBenchValidationTask) -> dict:
@@ -211,3 +214,97 @@ class Evaluator:
             f"instance_id={instance_id} resolved={int(resolved)} "
             f"image_name={image_name} run_id={run_id}"
         )
+
+    @classmethod
+    def _classify_scoring_exception(
+        cls,
+        exc: BaseException,
+        *,
+        validation_id: object,
+    ) -> tuple[str, str, dict[str, object]]:
+        details: dict[str, object] = {
+            "validation_id": validation_id,
+            "error": str(exc),
+        }
+
+        hf_rate_limit_details = cls._extract_hf_rate_limit_details(exc)
+        if hf_rate_limit_details is not None:
+            details.update(hf_rate_limit_details)
+            return (
+                cls.HF_RATE_LIMIT_ERROR_CODE,
+                f"Scoring rate limited by Hugging Face for validation_id={validation_id}: {exc}",
+                details,
+            )
+
+        return (
+            "validator_scoring_failed",
+            f"Scoring failed for validation_id={validation_id}: {exc}",
+            details,
+        )
+
+    @classmethod
+    def _extract_hf_rate_limit_details(
+        cls,
+        exc: BaseException,
+    ) -> dict[str, object] | None:
+        for candidate in cls._iter_exception_chain(exc):
+            response = getattr(candidate, "response", None)
+            if getattr(response, "status_code", None) != 429:
+                continue
+
+            request = getattr(response, "request", None)
+            request_url = str(getattr(request, "url", ""))
+            module_name = type(candidate).__module__
+            if not cls._is_huggingface_exception(candidate, request_url, module_name):
+                continue
+
+            headers = getattr(response, "headers", {}) or {}
+            details: dict[str, object] = {
+                "provider": "huggingface",
+                "status_code": 429,
+            }
+            if request_url:
+                details["request_url"] = request_url
+
+            retry_after = headers.get("retry-after")
+            if retry_after is not None:
+                details["retry_after"] = str(retry_after)
+
+            request_id = getattr(candidate, "request_id", None)
+            if request_id:
+                details["request_id"] = request_id
+
+            return details
+
+        return None
+
+    @staticmethod
+    def _is_huggingface_exception(
+        candidate: BaseException,
+        request_url: str,
+        module_name: str,
+    ) -> bool:
+        if module_name.startswith("huggingface_hub"):
+            return True
+
+        lowered_url = request_url.lower()
+        return "huggingface.co" in lowered_url or "hf.co" in lowered_url
+
+    @staticmethod
+    def _iter_exception_chain(exc: BaseException):
+        seen: set[int] = set()
+        stack = [exc]
+        while stack:
+            candidate = stack.pop()
+            candidate_id = id(candidate)
+            if candidate_id in seen:
+                continue
+            seen.add(candidate_id)
+            yield candidate
+
+            cause = getattr(candidate, "__cause__", None)
+            context = getattr(candidate, "__context__", None)
+            if cause is not None:
+                stack.append(cause)
+            if context is not None and context is not cause:
+                stack.append(context)

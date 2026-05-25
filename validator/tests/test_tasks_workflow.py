@@ -34,6 +34,7 @@ def _make_validator():
         platform_signer_ss58="expected-signer",
         wallet=object(),
         scoring_error_cooldown_seconds=600.0,
+        hf_rate_limit_cooldown_seconds=120.0,
         swebench_validation_request_path="/validator/get_swebench_validation",
         swebench_validation_submit_path="/validator/submit_swebench_validation_score",
     )
@@ -125,6 +126,10 @@ def test_compute_backoff_interval_hybrid_policy():
 def test_resolve_scoring_error_cooldown_seconds():
     validator = _make_validator()
 
+    assert (
+        validator._resolve_scoring_error_cooldown_seconds("validator_hf_rate_limited")
+        == 120.0
+    )
     assert (
         validator._resolve_scoring_error_cooldown_seconds("validator_scoring_failed")
         == 600.0

@@ -404,6 +404,8 @@ class Validator(AbstractValidator):
         return max(0.5, min(base_poll_interval, 1.0))
 
     def _resolve_scoring_error_cooldown_seconds(self, error_code: str) -> float:
+        if error_code == "validator_hf_rate_limited":
+            return max(0.0, self.settings.hf_rate_limit_cooldown_seconds)
         if error_code == "validator_scoring_failed":
             return max(30.0, self.settings.scoring_error_cooldown_seconds)
         return 0.0

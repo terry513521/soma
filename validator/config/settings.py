@@ -25,6 +25,7 @@ class Settings(BaseModel):
     # Validator scoring settings
     max_concurrent_evaluations: int
     scoring_error_cooldown_seconds: float
+    hf_rate_limit_cooldown_seconds: float
     http_timeout_seconds: float
     weight_block_interval:int
     swebench_dataset_name: str
@@ -85,6 +86,10 @@ class Settings(BaseModel):
             scoring_error_cooldown_seconds=cls._get_float(
                 "SCORING_ERROR_COOLDOWN_SECONDS",
                 600.0,
+            ),
+            hf_rate_limit_cooldown_seconds=cls._get_float(
+                "HF_RATE_LIMIT_COOLDOWN_SECONDS",
+                120.0,
             ),
             http_timeout_seconds = cls._get_float("HTTP_TIMEOUT_SECONDS", 240.0),
             weight_block_interval = 110,
