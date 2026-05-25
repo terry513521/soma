@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 import importlib
 import inspect
 import logging
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,6 +29,7 @@ LOG_TEST_OUTPUT = "test_output.txt"
 START_TEST_OUTPUT = ">>>>> Start Test Output"
 END_TEST_OUTPUT = ">>>>> End Test Output"
 PYTEST_SESSION_START = "============================= test session starts =============================="
+HTTP_PROBE_LOGGER_NAMES = ("httpx", "httpcore")
 
 
 class SWEBenchEvaluationError(RuntimeError):
@@ -45,6 +48,10 @@ class SWEBenchEvaluationResult:
 
 
 class SWEBenchContainerEvaluator:
+    _http_probe_log_lock = threading.Lock()
+    _http_probe_log_active_count = 0
+    _http_probe_log_original_levels: dict[str, int] = {}
+
     def __init__(self, settings=None):
         self.settings = settings
 
@@ -132,11 +139,12 @@ class SWEBenchContainerEvaluator:
 
         client = None
         try:
-            dataset = harness.load_swebench_dataset(
-                name=dataset_name,
-                split=dataset_split,
-                instance_ids=[normalized_instance_id],
-            )
+            with self._quiet_http_probe_logs():
+                dataset = harness.load_swebench_dataset(
+                    name=dataset_name,
+                    split=dataset_split,
+                    instance_ids=[normalized_instance_id],
+                )
             if not dataset:
                 raise SWEBenchEvaluationError(
                     f"Instance {normalized_instance_id} not found in dataset {dataset_name}:{dataset_split}"
@@ -214,6 +222,43 @@ class SWEBenchContainerEvaluator:
             "security_opt": ["no-new-privileges:true"],
             "pids_limit": DEFAULT_CONTAINER_PIDS_LIMIT,
         }
+
+    @classmethod
+    @contextmanager
+    def _quiet_http_probe_logs(cls):
+        cls._enter_quiet_http_probe_logs()
+
+        try:
+            yield
+        finally:
+            cls._exit_quiet_http_probe_logs()
+
+    @classmethod
+    def _enter_quiet_http_probe_logs(cls) -> None:
+        with cls._http_probe_log_lock:
+            if cls._http_probe_log_active_count == 0:
+                cls._http_probe_log_original_levels = {}
+                for logger_name in HTTP_PROBE_LOGGER_NAMES:
+                    library_logger = logging.getLogger(logger_name)
+                    cls._http_probe_log_original_levels[logger_name] = library_logger.level
+                    library_logger.setLevel(max(library_logger.level, logging.WARNING))
+
+            cls._http_probe_log_active_count += 1
+
+    @classmethod
+    def _exit_quiet_http_probe_logs(cls) -> None:
+        with cls._http_probe_log_lock:
+            if cls._http_probe_log_active_count <= 0:
+                return
+
+            cls._http_probe_log_active_count -= 1
+            if cls._http_probe_log_active_count != 0:
+                return
+
+            original_levels = cls._http_probe_log_original_levels
+            cls._http_probe_log_original_levels = {}
+            for logger_name, level in original_levels.items():
+                logging.getLogger(logger_name).setLevel(level)
 
     @staticmethod
     def _prefer_nonroot_test_execution(test_spec: object) -> None:
