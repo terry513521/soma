@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import math
+import random
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -11,7 +13,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.logging import get_logger
-from app.services.blob.patch_artifact_storage import PatchArtifactStorage
 from app.services.blob.s3 import S3BlobStorage
 from app.services.sandbox.remote_compact_bench_manager import RemoteCompactBenchManager
 from soma_shared.db.models.miner import Miner
@@ -31,6 +32,10 @@ logger = get_logger(__name__)
 _ORCHESTRATOR_LOCK_KEY = "swebench-orchestrator-v1"
 _SEED_IDLE_LOG_INTERVAL_SECONDS = 60
 _LAST_IDLE_SEED_LOG_AT: datetime | None = None
+_LAST_CAPACITY_LOG_AT: float | None = None
+_CAPACITY_LOG_INTERVAL_SECONDS = 30.0
+_LAST_IDLE_DISPATCH_LOG_AT: float | None = None
+_DISPATCH_IDLE_LOG_INTERVAL_SECONDS = 30.0
 
 
 @dataclass(frozen=True)
@@ -77,6 +82,8 @@ async def _run_orchestrator_loop(app, interval_seconds: float) -> None:
 
 
 async def _run_orchestration_tick(app) -> None:
+    global _LAST_IDLE_DISPATCH_LOG_AT
+
     lock_conn = None
     lock_acquired = False
     try:
@@ -110,7 +117,7 @@ async def _run_orchestration_tick(app) -> None:
             break
 
         dispatched, deferred, failed = await _dispatch_due_runs(app, now)
-        if dispatched or deferred or failed:
+        if dispatched or failed:
             logger.info(
                 "swebench_orchestrator_dispatch_pass",
                 extra={
@@ -119,6 +126,23 @@ async def _run_orchestration_tick(app) -> None:
                     "failed": failed,
                 },
             )
+            _LAST_IDLE_DISPATCH_LOG_AT = None
+        elif deferred:
+            now_monotonic = time.monotonic()
+            if (
+                _LAST_IDLE_DISPATCH_LOG_AT is None
+                or (now_monotonic - _LAST_IDLE_DISPATCH_LOG_AT) >= _DISPATCH_IDLE_LOG_INTERVAL_SECONDS
+            ):
+                logger.info(
+                    "swebench_orchestrator_dispatch_pass_idle",
+                    extra={
+                        "dispatched": dispatched,
+                        "deferred": deferred,
+                        "failed": failed,
+                        "interval_seconds": _DISPATCH_IDLE_LOG_INTERVAL_SECONDS,
+                    },
+                )
+                _LAST_IDLE_DISPATCH_LOG_AT = now_monotonic
     finally:
         if lock_conn is not None:
             try:
@@ -134,7 +158,9 @@ async def _run_orchestration_tick(app) -> None:
 def _maybe_log_seed_pass(*, active_competitions: int, seeded_runs: int, now: datetime) -> None:
     global _LAST_IDLE_SEED_LOG_AT
 
-    if active_competitions > 0 or seeded_runs > 0:
+    # Log immediately only when new runs were seeded.
+    # Otherwise throttle to keep orchestrator logs readable.
+    if seeded_runs > 0:
         logger.info(
             "swebench_orchestrator_seed_pass",
             extra={
@@ -153,7 +179,11 @@ def _maybe_log_seed_pass(*, active_competitions: int, seeded_runs: int, now: dat
 
     if should_log_idle:
         logger.info(
-            "swebench_orchestrator_seed_pass_idle",
+            (
+                "swebench_orchestrator_seed_pass_idle"
+                if active_competitions == 0
+                else "swebench_orchestrator_seed_pass_noop"
+            ),
             extra={
                 "active_competitions": active_competitions,
                 "seeded_runs": seeded_runs,
@@ -476,8 +506,6 @@ async def _create_run_and_validation(
         tokens_used=None,
         time_taken_seconds=None,
         agent_steps=None,
-        status="pending",
-        last_error=None,
         baseline_run=baseline_run,
     )
     db.add(run)
@@ -488,9 +516,6 @@ async def _create_run_and_validation(
         request_fk=None,
         validator_fk=None,
         resolved=None,
-        logs=None,
-        claimed_at=None,
-        claim_expires_at=None,
         scored_at=None,
     )
     db.add(validation)
@@ -500,90 +525,285 @@ async def _dispatch_due_runs(
     app,
     now: datetime,
 ) -> tuple[int, int, int]:
+    global _LAST_CAPACITY_LOG_AT
+
     manager = _get_compact_bench_manager(app)
-    output_storage = _get_output_storage(app)
     s3_storage = _get_s3_storage(app)
 
     dispatched = 0
     deferred = 0
     failed = 0
 
+    retry_not_before: dict[int, float] = getattr(app.state, "swebench_retry_not_before", {})
+    retry_attempts: dict[int, int] = getattr(app.state, "swebench_retry_attempts", {})
+    global_not_before: float = float(getattr(app.state, "swebench_global_retry_not_before", 0.0))
+    app.state.swebench_retry_not_before = retry_not_before
+    app.state.swebench_retry_attempts = retry_attempts
+
     async for db in get_db_session():
+        batch_size = max(1, int(settings.swebench_dispatch_batch_size))
+        fetch_limit = min(200, batch_size * 5)
         due_rows = (
             await db.execute(
-                select(SweBenchRun, SweBenchTask)
-                .join(SweBenchTask, SweBenchTask.id == SweBenchRun.task_fk)
-                .where(SweBenchRun.status == "pending")
-                .order_by(SweBenchRun.created_at.asc())
-                .limit(max(1, int(settings.swebench_dispatch_batch_size)))
-                .with_for_update(skip_locked=True)
+                text(
+                    """
+                    SELECT
+                        r.id AS run_id,
+                        r.diff_storage_uuid,
+                        r.attempt_no,
+                        r.miner_fk,
+                        r.script_fk,
+                        r.baseline_run,
+                        t.id AS task_id,
+                        t.competition_fk,
+                        t.instance_id,
+                        t.planned_repeats,
+                        t.is_screener
+                    FROM swe_bench_runs r
+                    JOIN swe_bench_tasks t ON t.id = r.task_fk
+                    WHERE r.status = 'pending'
+                    ORDER BY r.created_at ASC
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT :limit
+                    """
+                ),
+                {"limit": fetch_limit},
             )
-        ).all()
+        ).mappings().all()
 
         if not due_rows:
             await db.rollback()
             break
 
+        now_monotonic = time.monotonic()
+        if global_not_before > now_monotonic:
+            deferred += len(due_rows)
+            await db.rollback()
+            if (
+                _LAST_CAPACITY_LOG_AT is None
+                or (now_monotonic - _LAST_CAPACITY_LOG_AT) >= _CAPACITY_LOG_INTERVAL_SECONDS
+            ):
+                _LAST_CAPACITY_LOG_AT = now_monotonic
+                logger.info(
+                    "swebench_orchestrator_capacity_cooldown_active",
+                    extra={
+                        "cooldown_seconds_left": round(global_not_before - now_monotonic, 2),
+                        "deferred_runs": len(due_rows),
+                    },
+                )
+            break
+
+        dispatch_rows: list[dict] = []
+        deferred_by_cooldown = 0
+        for row in due_rows:
+            run_id = int(row["run_id"])
+            retry_at = retry_not_before.get(run_id)
+            if retry_at is not None and retry_at > now_monotonic:
+                deferred_by_cooldown += 1
+                continue
+            dispatch_rows.append(row)
+            if len(dispatch_rows) >= batch_size:
+                break
+
+        if not dispatch_rows:
+            deferred += deferred_by_cooldown
+            await db.rollback()
+            break
+
         expires_in = int(max(60.0, float(settings.sandbox_timeout_per_task_seconds) + 300.0))
 
-        for run, task in due_rows:
-            storage_key = output_storage.build_key(run.diff_storage_uuid)
-            storage_presigned_url = await s3_storage.generate_presigned_url(
-                storage_key,
-                "put_object",
+        for row in dispatch_rows:
+            run_id = int(row["run_id"])
+            script_presigned_url = await _resolve_script_presigned_url(
+                db=db,
+                app=app,
+                s3_storage=s3_storage,
                 expires_in=expires_in,
+                script_fk=row.get("script_fk"),
+                miner_fk=row.get("miner_fk"),
+                baseline_run=bool(row["baseline_run"]),
             )
 
             ok, error, retryable = await manager.dispatch_swebench_run(
-                run_id=int(run.id),
+                run_id=run_id,
                 benchmark=str(settings.swebench_benchmark_name),
-                instance_id=str(task.instance_id),
-                storage_uuid=str(run.diff_storage_uuid),
-                storage_presigned_url=storage_presigned_url,
+                instance_id=str(row["instance_id"]),
+                storage_uuid=str(row["diff_storage_uuid"]),
+                script_presigned_url=script_presigned_url,
                 task_context={
-                    "competition_fk": int(task.competition_fk),
-                    "miner_fk": run.miner_fk,
-                    "script_fk": run.script_fk,
-                    "attempt_no": int(run.attempt_no),
-                    "planned_repeats": int(task.planned_repeats),
-                    "baseline_run": bool(run.baseline_run),
-                    "is_screener": bool(task.is_screener),
+                    "competition_fk": int(row["competition_fk"]),
+                    "miner_fk": row["miner_fk"],
+                    "script_fk": row["script_fk"],
+                    "attempt_no": int(row["attempt_no"]),
+                    "planned_repeats": int(row["planned_repeats"]),
+                    "baseline_run": bool(row["baseline_run"]),
+                    "is_screener": bool(row["is_screener"]),
                 },
             )
 
             if ok:
-                run.status = "dispatched"
-                run.last_error = None
+                await db.execute(
+                    text(
+                        "UPDATE swe_bench_runs SET status = 'dispatched', last_error = NULL, updated_at = now() WHERE id = :run_id"
+                    ),
+                    {"run_id": run_id},
+                )
                 dispatched += 1
+                retry_not_before.pop(run_id, None)
+                retry_attempts.pop(run_id, None)
                 continue
 
-            run.last_error = error
             if retryable:
+                attempt = retry_attempts.get(run_id, 0) + 1
+                retry_attempts[run_id] = attempt
+                base = max(0.1, float(settings.swebench_retry_base_seconds))
+                max_seconds = max(base, float(settings.swebench_retry_max_seconds))
+                jitter = max(0.0, float(settings.swebench_retry_jitter_seconds))
+                backoff_seconds = min(max_seconds, base * (2 ** max(0, attempt - 1)))
+                if jitter > 0:
+                    backoff_seconds += random.uniform(0.0, jitter)
+                retry_not_before[run_id] = time.monotonic() + backoff_seconds
+
                 # Keep run pending; orchestrator will retry in next polling tick.
-                run.status = "pending"
+                await db.execute(
+                    text(
+                        "UPDATE swe_bench_runs SET status = 'pending', last_error = :error, updated_at = now() WHERE id = :run_id"
+                    ),
+                    {"run_id": run_id, "error": error},
+                )
                 deferred += 1
+
+                is_capacity_error = bool(error) and "at capacity" in error.lower()
+                if is_capacity_error:
+                    cooldown_seconds = min(max_seconds, base + (random.uniform(0.0, jitter) if jitter > 0 else 0.0))
+                    app.state.swebench_global_retry_not_before = time.monotonic() + cooldown_seconds
+                    break
             else:
-                run.status = "failed"
+                retry_not_before.pop(run_id, None)
+                retry_attempts.pop(run_id, None)
+                await db.execute(
+                    text(
+                        "UPDATE swe_bench_runs SET status = 'failed', last_error = :error, updated_at = now() WHERE id = :run_id"
+                    ),
+                    {"run_id": run_id, "error": error},
+                )
                 failed += 1
 
+        deferred += deferred_by_cooldown
         await db.commit()
         break
 
     return dispatched, deferred, failed
+
+
+async def _resolve_script_presigned_url(
+    *,
+    db: AsyncSession,
+    app,
+    s3_storage: S3BlobStorage,
+    expires_in: int,
+    script_fk,
+    miner_fk,
+    baseline_run: bool,
+) -> str:
+    script_context = await _load_script_dispatch_context(
+        db=db,
+        script_fk=script_fk,
+        miner_fk=miner_fk,
+    )
+    if script_context is not None:
+        script_uuid, script_created_at, miner_ss58 = script_context
+        date_prefix = (
+            script_created_at.strftime("%Y-%m-%d")
+            if script_created_at is not None
+            else None
+        )
+        key = f"hot/miner_solutions/{miner_ss58}"
+        if date_prefix:
+            key = f"{key}/{date_prefix}"
+        key = f"{key}/{script_uuid}.py"
+        return await s3_storage.generate_presigned_url(
+            key,
+            "get_object",
+            expires_in=expires_in,
+        )
+    return await _get_baseline_script_presigned_url(
+        app=app,
+        s3_storage=s3_storage,
+        expires_in=expires_in,
+        baseline_run=baseline_run,
+    )
+
+
+async def _get_baseline_script_presigned_url(
+    *,
+    app,
+    s3_storage: S3BlobStorage,
+    expires_in: int,
+    baseline_run: bool,
+) -> str:
+    key = getattr(app.state, "swebench_baseline_script_key", None)
+    if not key:
+        key = "hot/miner_solutions/__baseline__/baseline_default.py"
+        script = (
+            "from typing import Optional\n\n"
+            "def main(task: str, compression_ratio: Optional[float]) -> str:\n"
+            "    return task or ''\n"
+        )
+        await s3_storage.put_bytes(
+            key,
+            script.encode("utf-8"),
+            content_type="text/x-python",
+        )
+        app.state.swebench_baseline_script_key = key
+
+    if not baseline_run:
+        logger.warning(
+            "swebench_missing_miner_script_fallback_used",
+            extra={"baseline_run": baseline_run},
+        )
+    return await s3_storage.generate_presigned_url(
+        key,
+        "get_object",
+        expires_in=expires_in,
+    )
+
+
+async def _load_script_dispatch_context(
+    *,
+    db: AsyncSession,
+    script_fk,
+    miner_fk,
+) -> tuple[str, datetime | None, str] | None:
+    if not script_fk or not miner_fk:
+        return None
+
+    row = (
+        await db.execute(
+            text(
+                """
+                SELECT s.script_uuid, s.created_at, m.ss58
+                FROM scripts s
+                JOIN miners m ON m.id = s.miner_fk
+                WHERE s.id = :script_fk
+                  AND m.id = :miner_fk
+                LIMIT 1
+                """
+            ),
+            {"script_fk": int(script_fk), "miner_fk": int(miner_fk)},
+        )
+    ).first()
+    if not row:
+        return None
+    return str(row[0]), row[1], str(row[2])
+
+
 def _get_s3_storage(app) -> S3BlobStorage:
     s3_storage = getattr(app.state, "swebench_s3_storage", None)
     if s3_storage is None:
         s3_storage = S3BlobStorage()
         app.state.swebench_s3_storage = s3_storage
     return s3_storage
-
-
-def _get_output_storage(app) -> PatchArtifactStorage:
-    output_storage = getattr(app.state, "swebench_output_storage", None)
-    if output_storage is None:
-        output_storage = PatchArtifactStorage(_get_s3_storage(app))
-        app.state.swebench_output_storage = output_storage
-    return output_storage
 
 
 def _get_compact_bench_manager(app) -> RemoteCompactBenchManager:
@@ -598,6 +818,7 @@ def _get_compact_bench_manager(app) -> RemoteCompactBenchManager:
             sandbox_service_url=service_url,
             execution_timeout_seconds=settings.sandbox_timeout_per_task_seconds,
             submission_timeout_seconds=settings.sandbox_submission_timeout_seconds,
+            default_model=settings.swebench_default_model,
         )
         app.state.swebench_compact_bench_manager = manager
     return manager

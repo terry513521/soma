@@ -196,6 +196,10 @@ class Settings(BaseSettings):
         default="SWE-bench/SWE-bench_Verified",
         alias="SWEBENCH_BENCHMARK_NAME",
     )
+    swebench_default_model: str = Field(
+        default="qwen/qwen3-coder",
+        alias="SWEBENCH_DEFAULT_MODEL",
+    )
     swebench_orchestrator_interval_seconds: float = Field(
         default=2.0,
         alias="SWEBENCH_ORCHESTRATOR_INTERVAL_SECONDS",

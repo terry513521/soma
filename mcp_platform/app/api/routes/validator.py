@@ -59,6 +59,32 @@ logger = get_logger(__name__)
 router = APIRouter(tags=["validator"])
 
 
+def _model_attr(model: type, name: str):
+    try:
+        return getattr(model, name)
+    except AttributeError:
+        return None
+
+
+def _completed_run_condition():
+    status_col = _model_attr(SweBenchRun, "status")
+    if status_col is not None:
+        return status_col == "completed"
+
+    # Backward compatibility for soma_shared branches without SweBenchRun.status.
+    # Treat run as finished when compact-bench report touched at least one persisted field.
+    report_markers = [
+        _model_attr(SweBenchRun, "tokens_used"),
+        _model_attr(SweBenchRun, "time_taken_seconds"),
+        _model_attr(SweBenchRun, "agent_steps"),
+        _model_attr(SweBenchRun, "last_error"),
+    ]
+    predicates = [col.is_not(None) for col in report_markers if col is not None]
+    if not predicates:
+        return None
+    return or_(*predicates)
+
+
 def _miners_log(miners_list: list[MinerWeight]) -> list[dict[str, float | int]]:
     return [{"uid": miner.uid, "weight": float(miner.weight)} for miner in miners_list]
 
@@ -658,58 +684,75 @@ async def get_swebench_validation(
 
     claim_ttl_seconds = max(60, int(settings.swebench_validation_claim_ttl_seconds))
     claim_expires_at = now + timedelta(seconds=claim_ttl_seconds)
+    claim_expires_col = _model_attr(SweBenchRunValidation, "claim_expires_at")
+    claimed_at_col = _model_attr(SweBenchRunValidation, "claimed_at")
+    validator_fk_col = _model_attr(SweBenchRunValidation, "validator_fk")
+    completed_condition = _completed_run_condition()
 
     task_payload: SweBenchValidationTask | None = None
-    candidate_row = (
-        await db.execute(
+    query_mine = (
+        select(SweBenchRunValidation, SweBenchRun, SweBenchTask)
+        .join(SweBenchRun, SweBenchRun.id == SweBenchRunValidation.run_fk)
+        .join(SweBenchTask, SweBenchTask.id == SweBenchRun.task_fk)
+        .where(SweBenchRunValidation.scored_at.is_(None))
+        .where(SweBenchRunValidation.resolved.is_(None))
+    )
+    if completed_condition is not None:
+        query_mine = query_mine.where(completed_condition)
+    if validator_fk_col is not None:
+        query_mine = query_mine.where(validator_fk_col == validator.id)
+    if claim_expires_col is not None:
+        query_mine = query_mine.where(
+            or_(
+                claim_expires_col.is_(None),
+                claim_expires_col > now,
+            )
+        )
+    if claimed_at_col is not None:
+        query_mine = query_mine.order_by(claimed_at_col.asc(), SweBenchRunValidation.id.asc())
+    else:
+        query_mine = query_mine.order_by(SweBenchRunValidation.id.asc())
+    query_mine = query_mine.with_for_update(skip_locked=True).limit(1)
+    candidate_row = (await db.execute(query_mine)).first()
+
+    if candidate_row is None:
+        query_unclaimed = (
             select(SweBenchRunValidation, SweBenchRun, SweBenchTask)
             .join(SweBenchRun, SweBenchRun.id == SweBenchRunValidation.run_fk)
             .join(SweBenchTask, SweBenchTask.id == SweBenchRun.task_fk)
-            .where(SweBenchRun.status == "completed")
             .where(SweBenchRunValidation.scored_at.is_(None))
             .where(SweBenchRunValidation.resolved.is_(None))
-            .where(SweBenchRunValidation.validator_fk == validator.id)
-            .where(
-                or_(
-                    SweBenchRunValidation.claim_expires_at.is_(None),
-                    SweBenchRunValidation.claim_expires_at > now,
+        )
+        if completed_condition is not None:
+            query_unclaimed = query_unclaimed.where(completed_condition)
+        if validator_fk_col is not None:
+            if claim_expires_col is not None:
+                query_unclaimed = query_unclaimed.where(
+                    or_(
+                        validator_fk_col.is_(None),
+                        claim_expires_col.is_(None),
+                        claim_expires_col < now,
+                    )
                 )
-            )
-            .order_by(SweBenchRunValidation.claimed_at.asc(), SweBenchRunValidation.id.asc())
+            else:
+                query_unclaimed = query_unclaimed.where(validator_fk_col.is_(None))
+        query_unclaimed = (
+            query_unclaimed.order_by(SweBenchRunValidation.id.asc())
             .with_for_update(skip_locked=True)
             .limit(1)
         )
-    ).first()
-
-    if candidate_row is None:
-        candidate_row = (
-            await db.execute(
-                select(SweBenchRunValidation, SweBenchRun, SweBenchTask)
-                .join(SweBenchRun, SweBenchRun.id == SweBenchRunValidation.run_fk)
-                .join(SweBenchTask, SweBenchTask.id == SweBenchRun.task_fk)
-                .where(SweBenchRun.status == "completed")
-                .where(SweBenchRunValidation.scored_at.is_(None))
-                .where(SweBenchRunValidation.resolved.is_(None))
-                .where(
-                    or_(
-                        SweBenchRunValidation.validator_fk.is_(None),
-                        SweBenchRunValidation.claim_expires_at.is_(None),
-                        SweBenchRunValidation.claim_expires_at < now,
-                    )
-                )
-                .order_by(SweBenchRunValidation.id.asc())
-                .with_for_update(skip_locked=True)
-                .limit(1)
-            )
-        ).first()
+        candidate_row = (await db.execute(query_unclaimed)).first()
 
     if candidate_row is not None:
         validation_row, run_row, task_row = candidate_row
-        is_new_claim = int(validation_row.validator_fk or 0) != int(validator.id)
-        validation_row.validator_fk = validator.id
-        if is_new_claim or validation_row.claimed_at is None:
+        current_validator_fk = getattr(validation_row, "validator_fk", None)
+        is_new_claim = int(current_validator_fk or 0) != int(validator.id)
+        if validator_fk_col is not None:
+            validation_row.validator_fk = validator.id
+        if claimed_at_col is not None and (is_new_claim or getattr(validation_row, "claimed_at", None) is None):
             validation_row.claimed_at = now
-        validation_row.claim_expires_at = claim_expires_at
+        if claim_expires_col is not None:
+            validation_row.claim_expires_at = claim_expires_at
         await db.commit()
 
         output_storage = _get_output_storage(request)
@@ -727,10 +770,16 @@ async def get_swebench_validation(
                 },
                 exc_info=exc,
             )
-            validation_row.validator_fk = None
-            validation_row.claimed_at = None
-            validation_row.claim_expires_at = None
-            await db.commit()
+            if validator_fk_col is not None:
+                validation_row.validator_fk = None
+            if claimed_at_col is not None:
+                validation_row.claimed_at = None
+            if claim_expires_col is not None:
+                validation_row.claim_expires_at = None
+            try:
+                await db.commit()
+            except Exception:
+                await db.rollback()
             diff_text = None
 
         if diff_text is not None:
@@ -810,6 +859,10 @@ async def submit_swebench_validation_score(
         )
 
     validation_row, _run_row, task_row = row
+    claim_expires_col = _model_attr(SweBenchRunValidation, "claim_expires_at")
+    claimed_at_col = _model_attr(SweBenchRunValidation, "claimed_at")
+    logs_col = _model_attr(SweBenchRunValidation, "logs")
+    validator_fk_col = _model_attr(SweBenchRunValidation, "validator_fk")
 
     if str(task_row.instance_id) != str(payload.instance_id):
         raise HTTPException(
@@ -837,9 +890,11 @@ async def submit_swebench_validation_score(
         return response
 
     if (
-        validation_row.validator_fk is not None
+        validator_fk_col is not None
+        and getattr(validation_row, "validator_fk", None) is not None
         and int(validation_row.validator_fk) != int(validator.id)
-        and validation_row.claim_expires_at is not None
+        and claim_expires_col is not None
+        and getattr(validation_row, "claim_expires_at", None) is not None
         and validation_row.claim_expires_at > now
     ):
         raise HTTPException(
@@ -847,12 +902,16 @@ async def submit_swebench_validation_score(
             detail="Validation task is currently claimed by another validator",
         )
 
-    validation_row.validator_fk = validator.id
+    if validator_fk_col is not None:
+        validation_row.validator_fk = validator.id
     validation_row.resolved = bool(payload.resolved)
-    validation_row.logs = payload.logs
+    if logs_col is not None:
+        validation_row.logs = payload.logs
     validation_row.scored_at = now
-    validation_row.claimed_at = validation_row.claimed_at or now
-    validation_row.claim_expires_at = now
+    if claimed_at_col is not None:
+        validation_row.claimed_at = getattr(validation_row, "claimed_at", None) or now
+    if claim_expires_col is not None:
+        validation_row.claim_expires_at = now
 
     await db.commit()
 

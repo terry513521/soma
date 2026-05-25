@@ -146,15 +146,17 @@ def _resolve_upstream_url(path: str) -> str:
     return f"{base_url.rstrip('/')}/{path.lstrip('/')}"
 
 
-async def _resolve_run_auth_context(run_id: int) -> tuple[bool, str | None]:
+async def _resolve_run_auth_context(run_id: int) -> tuple[bool, str | None, str | None]:
     engine: AsyncEngine = app.state.db_engine
     query = text(
         """
-        SELECT sbr.baseline_run, mok.secret_ref
+        SELECT sbr.baseline_run, mok.secret_ref, m.ss58
         FROM swe_bench_runs sbr
         LEFT JOIN miner_openrouter_api_keys mok
             ON mok.miner_fk = sbr.miner_fk
            AND mok.revoked_at IS NULL
+        LEFT JOIN miners m
+            ON m.id = sbr.miner_fk
         WHERE sbr.id = :run_id
         LIMIT 1
         """
@@ -166,11 +168,12 @@ async def _resolve_run_auth_context(run_id: int) -> tuple[bool, str | None]:
         raise ValueError(f"swe_bench_runs.id={run_id} not found")
     baseline_run = bool(row[0])
     api_key_path = str(row[1]).strip() if row[1] is not None else None
+    miner_hotkey = str(row[2]).strip() if row[2] is not None else None
     if not baseline_run and (not api_key_path):
         raise ValueError(
             f"No active miner OpenRouter key path found for swe_bench_runs.id={run_id}",
         )
-    return baseline_run, api_key_path
+    return baseline_run, api_key_path, miner_hotkey
 
 
 def _extract_forward_headers(request: Request) -> dict[str, str]:
@@ -189,9 +192,9 @@ async def health() -> dict[str, str]:
     return {"status": "healthy", "service": "gateway"}
 
 
-async def _resolve_authorization_header(run_id: int) -> str:
+async def _resolve_authorization_header(run_id: int) -> tuple[str, str]:
     try:
-        baseline_run, api_key_path = await _resolve_run_auth_context(run_id)
+        baseline_run, api_key_path, miner_hotkey = await _resolve_run_auth_context(run_id)
         if baseline_run:
             baseline_api_key = (os.getenv("GATEWAY_BASELINE_OPENROUTER_API_KEY") or "").strip()
             if not baseline_api_key:
@@ -199,12 +202,14 @@ async def _resolve_authorization_header(run_id: int) -> str:
                     "GATEWAY_BASELINE_OPENROUTER_API_KEY must be set for baseline runs",
                 )
             api_key_value = baseline_api_key
+            resolved_hotkey = "baseline"
         else:
             api_key_value = await asyncio.to_thread(_resolve_api_key_from_ssm, str(api_key_path))
+            resolved_hotkey = miner_hotkey or "unknown"
     except Exception as exc:
         logger.exception("Failed to resolve API key for run_id=%s", run_id)
         raise HTTPException(status_code=400, detail=f"API key resolution failed: {exc}") from exc
-    return f"Bearer {api_key_value}"
+    return f"Bearer {api_key_value}", resolved_hotkey
 
 
 async def _stream_upstream_response(
@@ -273,10 +278,13 @@ async def proxy_openai_compatible(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="X-Run-Id must be an integer") from exc
 
-    headers = _extract_forward_headers(request)
-    headers["Authorization"] = await _resolve_authorization_header(run_id)
-
     method = request.method.upper()
+    logger.info("gateway_request_received run_id=%s method=%s path=/v1/%s", run_id, method, path)
+
+    headers = _extract_forward_headers(request)
+    auth_header, miner_hotkey = await _resolve_authorization_header(run_id)
+    headers["Authorization"] = auth_header
+
     body_bytes = await request.body()
     parsed = None
     if body_bytes:
@@ -301,6 +309,14 @@ async def proxy_openai_compatible(
             for key, value in response_headers.items()
             if key.lower() != "content-type"
         }
+        logger.info(
+            "gateway_request_completed run_id=%s miner_hotkey=%s method=%s path=/v1/%s status_code=%s stream=true",
+            run_id,
+            miner_hotkey,
+            method,
+            path,
+            status_code,
+        )
         return StreamingResponse(
             stream,
             status_code=status_code,
@@ -312,10 +328,24 @@ async def proxy_openai_compatible(
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.request(method, url, headers=headers, content=body_bytes)
     except Exception as exc:
-        logger.exception("Upstream request failed for run_id=%s", run_id)
+        logger.exception(
+            "gateway_upstream_failed run_id=%s miner_hotkey=%s method=%s path=/v1/%s",
+            run_id,
+            miner_hotkey,
+            method,
+            path,
+        )
         raise HTTPException(status_code=502, detail=f"Upstream request failed: {exc}") from exc
 
     passthrough_headers = _select_passthrough_response_headers(resp.headers)
+    logger.info(
+        "gateway_request_completed run_id=%s miner_hotkey=%s method=%s path=/v1/%s status_code=%s",
+        run_id,
+        miner_hotkey,
+        method,
+        path,
+        resp.status_code,
+    )
     return Response(
         content=resp.content,
         status_code=resp.status_code,

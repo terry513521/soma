@@ -18,6 +18,7 @@ from app.services.sandbox.base import (
 
 
 logger = get_logger(__name__)
+_SWEBENCH_OPENCLAW_TIMEOUT_FALLBACK_SECONDS = 1800
 
 
 class RemoteCompactBenchManager:
@@ -29,17 +30,19 @@ class RemoteCompactBenchManager:
         sandbox_service_url: str,
         execution_timeout_seconds: float,
         submission_timeout_seconds: float,
+        default_model: str | None = None,
     ):
         self._sandbox_service_url = sandbox_service_url.rstrip("/")
         self._execution_timeout_seconds = execution_timeout_seconds
         self._submission_timeout_seconds = submission_timeout_seconds
+        self._default_model = (default_model or "").strip() or None
 
     async def execute_task(
         self,
         *,
         batch_id: str,
         storage_uuid: str,
-        storage_presigned_url: str,
+        script_presigned_url: str,
         challenge_text: str,
         task_context: dict[str, Any],
     ) -> SandboxTaskResult:
@@ -53,7 +56,7 @@ class RemoteCompactBenchManager:
             run_id=run_id,
             task_context=task_context,
             storage_uuid=storage_uuid,
-            storage_presigned_url=storage_presigned_url,
+            script_presigned_url=script_presigned_url,
             challenge_text=challenge_text,
         )
 
@@ -101,7 +104,7 @@ class RemoteCompactBenchManager:
         run_id: int,
         task_context: dict[str, Any],
         storage_uuid: str,
-        storage_presigned_url: str,
+        script_presigned_url: str,
         challenge_text: str,
     ) -> CompactBenchRunTaskRequest:
         benchmark = str(task_context.get("benchmark") or "").strip()
@@ -133,17 +136,26 @@ class RemoteCompactBenchManager:
         if challenge_text:
             metadata.setdefault("problem_statement", challenge_text)
 
+        model_override = str(task_context.get("model")).strip() if task_context.get("model") else None
+        model = model_override or self._default_model
+
         return CompactBenchRunTaskRequest(
             benchmark=benchmark,
             instance_id=instance_id,
             run_id=run_id,
-            storage_presigned_url=storage_presigned_url,
+            script_presigned_url=script_presigned_url,
             agent_name=str(task_context.get("agent_name") or "openclaw").strip() or "openclaw",
-            model=str(task_context.get("model")).strip() if task_context.get("model") else None,
+            model=model,
             openclaw_timeout=(
                 int(task_context["openclaw_timeout"])
                 if task_context.get("openclaw_timeout") is not None
-                else int(max(1.0, self._execution_timeout_seconds))
+                else int(
+                    max(
+                        1.0,
+                        float(self._execution_timeout_seconds),
+                        float(_SWEBENCH_OPENCLAW_TIMEOUT_FALLBACK_SECONDS),
+                    )
+                )
             ),
             openclaw_disable_somarizer=bool(task_context.get("openclaw_disable_somarizer", False)),
             metadata=metadata,
@@ -185,7 +197,7 @@ class RemoteCompactBenchManager:
         benchmark: str,
         instance_id: str,
         storage_uuid: str,
-        storage_presigned_url: str,
+        script_presigned_url: str,
         task_context: dict[str, Any] | None = None,
     ) -> tuple[bool, str | None, bool]:
         context = dict(task_context or {})
@@ -196,7 +208,7 @@ class RemoteCompactBenchManager:
             run_id=int(run_id),
             task_context=context,
             storage_uuid=storage_uuid,
-            storage_presigned_url=storage_presigned_url,
+            script_presigned_url=script_presigned_url,
             challenge_text="",
         )
         timeout = max(1.0, float(self._submission_timeout_seconds))
