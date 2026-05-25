@@ -53,6 +53,7 @@ from soma_shared.db.models.challenge_batch import ChallengeBatch
 from soma_shared.db.models.competition import Competition
 from soma_shared.db.models.competition_challenge import CompetitionChallenge
 from soma_shared.db.models.competition_config import CompetitionConfig
+from soma_shared.db.models.competition_timeframe import CompetitionTimeframe
 from soma_shared.db.models.compression_competition_config import CompressionCompetitionConfig
 from soma_shared.db.models.miner import Miner
 from soma_shared.db.models.miner_upload import MinerUpload
@@ -533,22 +534,30 @@ async def get_current_competition_timeframe(
     request: Request,
     db: AsyncSession = Depends(get_db_session),
 ) -> CurrentCompetitionTimeframeResponse:
-    _cached = await _cache.get("competition_timeframe")
+    _cached = await _cache.get("competition_timeframe_v2")
     if _cached is not None:
         return _cached
 
-    # V_ACTIVE_COMPETITION already contains timeframe columns — no JOIN needed.
     row = (
         await db.execute(
             select(
-                V_ACTIVE_COMPETITION.c.competition_id,
-                V_ACTIVE_COMPETITION.c.competition_name,
-                V_ACTIVE_COMPETITION.c.upload_starts_at,
-                V_ACTIVE_COMPETITION.c.upload_ends_at,
-                V_ACTIVE_COMPETITION.c.eval_starts_at,
-                V_ACTIVE_COMPETITION.c.eval_ends_at,
+                Competition.id.label("competition_id"),
+                Competition.competition_name,
+                CompetitionTimeframe.upload_starts_at,
+                CompetitionTimeframe.upload_ends_at,
+                CompetitionTimeframe.eval_starts_at,
+                CompetitionTimeframe.eval_ends_at,
             )
-            .order_by(V_ACTIVE_COMPETITION.c.eval_ends_at.desc())
+            .join(
+                CompetitionConfig,
+                CompetitionConfig.competition_fk == Competition.id,
+            )
+            .join(
+                CompetitionTimeframe,
+                CompetitionTimeframe.competition_config_fk == CompetitionConfig.id,
+            )
+            .where(CompetitionConfig.is_active.is_(True))
+            .order_by(Competition.id.desc(), CompetitionTimeframe.created_at.desc())
             .limit(1)
         )
     ).first()
@@ -568,7 +577,7 @@ async def get_current_competition_timeframe(
         evaluation_end=row.eval_ends_at,
     )
 
-    await _cache.set("competition_timeframe", response, ttl=120)
+    await _cache.set("competition_timeframe_v2", response, ttl=120)
     logger.info(
         "[Frontend] Current timeframe: competition_id=%s, upload_start=%s, "
         "upload_end=%s, evaluation_start=%s, evaluation_end=%s",
