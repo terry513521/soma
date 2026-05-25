@@ -8,7 +8,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -232,7 +232,7 @@ async def _seed_runs_for_competition(
     task_repeats: dict[int, int] = {
         int(task.id): max(1, int(task.planned_repeats or 1)) for task in tasks
     }
-    screener_task_ids = [int(task.id) for task in tasks if bool(task.is_screener)]
+    screener_task_count = sum(1 for task in tasks if bool(task.is_screener))
 
     created = 0
     created += await _seed_baseline_runs(
@@ -241,6 +241,27 @@ async def _seed_runs_for_competition(
         task_repeats=task_repeats,
         now=now,
     )
+
+    baseline_complete = await _is_baseline_evaluation_complete(
+        db,
+        task_ids=[int(task.id) for task in tasks],
+        task_repeats=task_repeats,
+    )
+    if not baseline_complete:
+        return created
+
+    if screener_task_count > 0 and not await _competition_has_non_baseline_runs(
+        db,
+        competition_id=competition_id,
+    ):
+        await _select_dynamic_screener_tasks(
+            db,
+            tasks=tasks,
+            task_repeats=task_repeats,
+            screener_task_count=screener_task_count,
+        )
+
+    screener_task_ids = [int(task.id) for task in tasks if bool(task.is_screener)]
 
     scripts = await _load_latest_scripts_for_competition(db, competition_id)
     for script in scripts:
@@ -254,6 +275,115 @@ async def _seed_runs_for_competition(
         )
 
     return created
+
+
+async def _competition_has_non_baseline_runs(
+    db: AsyncSession,
+    *,
+    competition_id: int,
+) -> bool:
+    row = (
+        await db.execute(
+            text(
+                """
+                SELECT 1
+                FROM swe_bench_runs r
+                JOIN swe_bench_tasks t ON t.id = r.task_fk
+                WHERE t.competition_fk = :competition_id
+                  AND r.baseline_run = FALSE
+                LIMIT 1
+                """
+            ),
+            {"competition_id": int(competition_id)},
+        )
+    ).first()
+    return row is not None
+
+
+async def _is_baseline_evaluation_complete(
+    db: AsyncSession,
+    *,
+    task_ids: list[int],
+    task_repeats: dict[int, int],
+) -> bool:
+    if not task_ids:
+        return False
+
+    expected_runs = sum(max(1, int(task_repeats.get(task_id, 1))) for task_id in task_ids)
+    evaluated_runs = int(
+        (
+            await db.execute(
+                select(func.count(func.distinct(SweBenchRun.id)))
+                .join(SweBenchRunValidation, SweBenchRunValidation.run_fk == SweBenchRun.id)
+                .where(SweBenchRun.baseline_run.is_(True))
+                .where(SweBenchRun.task_fk.in_(task_ids))
+                .where(SweBenchRunValidation.scored_at.is_not(None))
+                .where(SweBenchRunValidation.resolved.is_not(None))
+            )
+        ).scalar()
+        or 0
+    )
+    return evaluated_runs >= expected_runs
+
+
+async def _select_dynamic_screener_tasks(
+    db: AsyncSession,
+    *,
+    tasks: list[SweBenchTask],
+    task_repeats: dict[int, int],
+    screener_task_count: int,
+) -> None:
+    if screener_task_count <= 0 or not tasks:
+        return
+
+    task_ids = [int(task.id) for task in tasks]
+    rows = (
+        await db.execute(
+            select(
+                SweBenchRun.task_fk,
+                SweBenchRunValidation.resolved,
+            )
+            .join(SweBenchRunValidation, SweBenchRunValidation.run_fk == SweBenchRun.id)
+            .where(SweBenchRun.baseline_run.is_(True))
+            .where(SweBenchRun.task_fk.in_(task_ids))
+            .where(SweBenchRunValidation.scored_at.is_not(None))
+            .where(SweBenchRunValidation.resolved.is_not(None))
+        )
+    ).all()
+
+    success_counts: dict[int, int] = {task_id: 0 for task_id in task_ids}
+    for task_fk, resolved in rows:
+        task_id = int(task_fk)
+        if bool(resolved):
+            success_counts[task_id] = success_counts.get(task_id, 0) + 1
+
+    by_success: dict[int, list[int]] = {}
+    for task_id in task_ids:
+        score = int(success_counts.get(task_id, 0))
+        by_success.setdefault(score, []).append(task_id)
+
+    selected: list[int] = []
+    for score in sorted(by_success.keys(), reverse=True):
+        candidates = by_success[score]
+        random.shuffle(candidates)
+        remaining = screener_task_count - len(selected)
+        if remaining <= 0:
+            break
+        selected.extend(candidates[:remaining])
+
+    selected_set = set(selected[:screener_task_count])
+    for task in tasks:
+        task.is_screener = int(task.id) in selected_set
+
+    logger.info(
+        "swebench_dynamic_screener_tasks_selected",
+        extra={
+            "task_ids": sorted(task_ids),
+            "selected_screener_task_ids": sorted(selected_set),
+            "requested_screener_task_count": int(screener_task_count),
+            "success_counts": {str(task_id): int(success_counts.get(task_id, 0)) for task_id in task_ids},
+        },
+    )
 
 
 async def _load_latest_scripts_for_competition(
