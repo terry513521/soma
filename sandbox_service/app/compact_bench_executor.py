@@ -147,15 +147,25 @@ def _normalize_proxy_upstream_base_url(value: str) -> str:
 
 
 def _build_nginx_config(*, upstream_base_url: str, listen_port: int) -> str:
+    connect_timeout = os.getenv("COMPACT_BENCH_NGINX_PROXY_CONNECT_TIMEOUT_SECONDS", "30").strip() or "30"
+    send_timeout = os.getenv("COMPACT_BENCH_NGINX_PROXY_SEND_TIMEOUT_SECONDS", "1800").strip() or "1800"
+    read_timeout = os.getenv("COMPACT_BENCH_NGINX_PROXY_READ_TIMEOUT_SECONDS", "1800").strip() or "1800"
+    keepalive_timeout = os.getenv("COMPACT_BENCH_NGINX_PROXY_KEEPALIVE_TIMEOUT_SECONDS", "75").strip() or "75"
     return "\n".join(
         [
             "events {}",
             "http {",
+            f"  keepalive_timeout {keepalive_timeout}s;",
             "  server {",
             f"    listen {listen_port};",
             "    location / {",
             f"      proxy_pass {upstream_base_url};",
             "      proxy_http_version 1.1;",
+            "      proxy_socket_keepalive on;",
+            f"      proxy_connect_timeout {connect_timeout}s;",
+            f"      proxy_send_timeout {send_timeout}s;",
+            f"      proxy_read_timeout {read_timeout}s;",
+            f"      send_timeout {send_timeout}s;",
             "      proxy_set_header Connection \"\";",
             "      proxy_set_header Host $proxy_host;",
             "      proxy_set_header X-Run-Id $http_x_run_id;",
@@ -549,11 +559,15 @@ class CompactBenchExecutor:
         )
         _ensure_docker_network(private_network_name, internal=True)
         logger.info(
-            "Starting compact-bench nginx proxy: container_name=%s upstream_host=%s private_network=%s proxy_port=%s",
+            "Starting compact-bench nginx proxy: container_name=%s upstream_host=%s private_network=%s proxy_port=%s connect_timeout=%ss send_timeout=%ss read_timeout=%ss keepalive_timeout=%ss",
             container_name,
             urlsplit(upstream_base_url).netloc,
             private_network_name,
             proxy_port,
+            os.getenv("COMPACT_BENCH_NGINX_PROXY_CONNECT_TIMEOUT_SECONDS", "30").strip() or "30",
+            os.getenv("COMPACT_BENCH_NGINX_PROXY_SEND_TIMEOUT_SECONDS", "1800").strip() or "1800",
+            os.getenv("COMPACT_BENCH_NGINX_PROXY_READ_TIMEOUT_SECONDS", "1800").strip() or "1800",
+            os.getenv("COMPACT_BENCH_NGINX_PROXY_KEEPALIVE_TIMEOUT_SECONDS", "75").strip() or "75",
         )
 
         result = _run_command(
