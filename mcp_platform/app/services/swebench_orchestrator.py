@@ -6,7 +6,7 @@ import random
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -108,12 +108,21 @@ async def _run_orchestration_tick(app) -> None:
             seeded_runs = 0
             for competition_id in active_competition_ids:
                 seeded_runs += await _seed_runs_for_competition(db, competition_id, now)
+            recovered_runs = await _recover_stale_dispatched_runs(db=db, now=now)
             await db.commit()
             _maybe_log_seed_pass(
                 active_competitions=len(active_competition_ids),
                 seeded_runs=seeded_runs,
                 now=now,
             )
+            if recovered_runs > 0:
+                logger.info(
+                    "swebench_orchestrator_recovered_stale_dispatched_runs",
+                    extra={
+                        "recovered_runs": recovered_runs,
+                        "ttl_seconds": int(max(60, int(settings.swebench_dispatched_ttl_seconds))),
+                    },
+                )
             break
 
         dispatched, deferred, failed = await _dispatch_due_runs(app, now)
@@ -191,6 +200,57 @@ def _maybe_log_seed_pass(*, active_competitions: int, seeded_runs: int, now: dat
             },
         )
         _LAST_IDLE_SEED_LOG_AT = now
+
+
+async def _recover_stale_dispatched_runs(
+    *,
+    db: AsyncSession,
+    now: datetime,
+) -> int:
+    ttl_seconds = max(60, int(settings.swebench_dispatched_ttl_seconds))
+    stale_before = now - timedelta(seconds=ttl_seconds)
+
+    stale_run_ids = [
+        int(row[0])
+        for row in (
+            await db.execute(
+                text(
+                    """
+                    SELECT id
+                    FROM swe_bench_runs
+                    WHERE status = 'dispatched'
+                      AND updated_at < :stale_before
+                    FOR UPDATE SKIP LOCKED
+                    """
+                ),
+                {"stale_before": stale_before},
+            )
+        ).all()
+    ]
+    if not stale_run_ids:
+        return 0
+
+    last_error = (
+        "Dispatch TTL exceeded without sandbox callback; "
+        f"automatically re-queued after {ttl_seconds}s."
+    )
+    for run_id in stale_run_ids:
+        await db.execute(
+            text(
+                """
+                UPDATE swe_bench_runs
+                SET status = 'pending',
+                    last_error = :last_error,
+                    updated_at = now()
+                WHERE id = :run_id
+                """
+            ),
+            {
+                "run_id": int(run_id),
+                "last_error": last_error,
+            },
+        )
+    return len(stale_run_ids)
 
 
 async def _get_active_competition_ids(db: AsyncSession, now: datetime) -> list[int]:
