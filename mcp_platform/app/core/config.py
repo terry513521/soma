@@ -232,6 +232,10 @@ class Settings(BaseSettings):
         default=0.5,
         alias="SWEBENCH_SCREENING_PASS_RATIO",
     )
+    swebench_dynamic_screener_task_count: int = Field(
+        default=3,
+        alias="SWEBENCH_DYNAMIC_SCREENER_TASK_COUNT",
+    )
 
     @field_validator("log_levels", mode="before")
     @classmethod

@@ -232,7 +232,7 @@ async def _seed_runs_for_competition(
     task_repeats: dict[int, int] = {
         int(task.id): max(1, int(task.planned_repeats or 1)) for task in tasks
     }
-    screener_task_count = sum(1 for task in tasks if bool(task.is_screener))
+    screener_task_count = _resolve_screener_task_count(tasks)
 
     created = 0
     created += await _seed_baseline_runs(
@@ -275,6 +275,16 @@ async def _seed_runs_for_competition(
         )
 
     return created
+
+
+def _resolve_screener_task_count(tasks: list[SweBenchTask]) -> int:
+    if not tasks:
+        return 0
+    preset_count = sum(1 for task in tasks if bool(task.is_screener))
+    if preset_count > 0:
+        return min(len(tasks), int(preset_count))
+    configured = max(0, int(getattr(settings, "swebench_dynamic_screener_task_count", 0)))
+    return min(len(tasks), configured)
 
 
 async def _competition_has_non_baseline_runs(
