@@ -53,6 +53,7 @@ from soma_shared.db.models.challenge_batch import ChallengeBatch
 from soma_shared.db.models.competition import Competition
 from soma_shared.db.models.competition_challenge import CompetitionChallenge
 from soma_shared.db.models.competition_config import CompetitionConfig
+from soma_shared.db.models.competition_timeframe import CompetitionTimeframe
 from soma_shared.db.models.compression_competition_config import CompressionCompetitionConfig
 from soma_shared.db.models.miner import Miner
 from soma_shared.db.models.miner_upload import MinerUpload
@@ -533,22 +534,30 @@ async def get_current_competition_timeframe(
     request: Request,
     db: AsyncSession = Depends(get_db_session),
 ) -> CurrentCompetitionTimeframeResponse:
-    _cached = await _cache.get("competition_timeframe")
+    _cached = await _cache.get("competition_timeframe_v2")
     if _cached is not None:
         return _cached
 
-    # V_ACTIVE_COMPETITION already contains timeframe columns — no JOIN needed.
     row = (
         await db.execute(
             select(
-                V_ACTIVE_COMPETITION.c.competition_id,
-                V_ACTIVE_COMPETITION.c.competition_name,
-                V_ACTIVE_COMPETITION.c.upload_starts_at,
-                V_ACTIVE_COMPETITION.c.upload_ends_at,
-                V_ACTIVE_COMPETITION.c.eval_starts_at,
-                V_ACTIVE_COMPETITION.c.eval_ends_at,
+                Competition.id.label("competition_id"),
+                Competition.competition_name,
+                CompetitionTimeframe.upload_starts_at,
+                CompetitionTimeframe.upload_ends_at,
+                CompetitionTimeframe.eval_starts_at,
+                CompetitionTimeframe.eval_ends_at,
             )
-            .order_by(V_ACTIVE_COMPETITION.c.eval_ends_at.desc())
+            .join(
+                CompetitionConfig,
+                CompetitionConfig.competition_fk == Competition.id,
+            )
+            .join(
+                CompetitionTimeframe,
+                CompetitionTimeframe.competition_config_fk == CompetitionConfig.id,
+            )
+            .where(CompetitionConfig.is_active.is_(True))
+            .order_by(Competition.id.desc(), CompetitionTimeframe.created_at.desc())
             .limit(1)
         )
     ).first()
@@ -568,7 +577,7 @@ async def get_current_competition_timeframe(
         evaluation_end=row.eval_ends_at,
     )
 
-    await _cache.set("competition_timeframe", response, ttl=120)
+    await _cache.set("competition_timeframe_v2", response, ttl=120)
     logger.info(
         "[Frontend] Current timeframe: competition_id=%s, upload_start=%s, "
         "upload_end=%s, evaluation_start=%s, evaluation_end=%s",
@@ -590,13 +599,12 @@ async def get_active_competitions(
     request: Request,
     db: AsyncSession = Depends(get_db_session),
 ) -> list[MinerCompetitionItem]:
-    # Temporary endpoint for competition list - needs to be changed in the future
     rows = (
         await db.execute(
             select(
-                V_ACTIVE_COMPETITION.c.competition_id,
-                V_ACTIVE_COMPETITION.c.competition_name,
-            ).order_by(V_ACTIVE_COMPETITION.c.competition_id)
+                Competition.id.label("competition_id"),
+                Competition.competition_name,
+            ).order_by(Competition.id.asc())
         )
     ).all()
 
@@ -731,6 +739,7 @@ async def list_miners_by_competition(
             detail="Competition not found",
         )
 
+    is_swe_competition = "swe" in comp_name.lower()
     show_partial_scores = await _get_is_partial_winner(db, comp_id)
 
     total_value = int(
@@ -779,6 +788,18 @@ async def list_miners_by_competition(
         )
     ).all()
 
+    swe_scores_by_hotkey: dict[str, float | None] = {}
+    if is_swe_competition and rows:
+        swe_rows = await _fetch_swe_rows(db, comp_id=comp_id)
+        swe_miner_rows: dict[str, list[sa.Row]] = {}
+        for swe_row in swe_rows:
+            swe_miner_rows.setdefault(str(swe_row.hotkey), []).append(swe_row)
+
+        swe_scores_by_hotkey = {
+            hotkey: build_swe_miner_scores(build_swe_task_groups(task_rows))[0]
+            for hotkey, task_rows in swe_miner_rows.items()
+        }
+
     miners = []
     for r in rows:
         miner_st = r.status or "in queue"
@@ -796,6 +817,7 @@ async def list_miners_by_competition(
             MinerListItem(
                 hotkey=r.ss58,
                 score=competition_score,
+                total_score=swe_scores_by_hotkey.get(str(r.ss58)) if is_swe_competition else None,
                 partial_scores=competition_partial_scores,
                 last_submit=r.last_submit_at,
                 status=miner_st,

@@ -208,6 +208,10 @@ class Settings(BaseSettings):
         default=8,
         alias="SWEBENCH_DISPATCH_BATCH_SIZE",
     )
+    swebench_dispatched_ttl_seconds: int = Field(
+        default=2400,
+        alias="SWEBENCH_DISPATCHED_TTL_SECONDS",
+    )
     swebench_retry_base_seconds: float = Field(
         default=5.0,
         alias="SWEBENCH_RETRY_BASE_SECONDS",
@@ -231,6 +235,10 @@ class Settings(BaseSettings):
     swebench_screening_pass_ratio: float = Field(
         default=0.5,
         alias="SWEBENCH_SCREENING_PASS_RATIO",
+    )
+    swebench_dynamic_screener_task_count: int = Field(
+        default=3,
+        alias="SWEBENCH_DYNAMIC_SCREENER_TASK_COUNT",
     )
 
     @field_validator("log_levels", mode="before")

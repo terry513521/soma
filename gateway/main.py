@@ -294,7 +294,7 @@ async def proxy_openai_compatible(
             parsed = None
 
     url = _build_upstream_url(path, request.url.query)
-    timeout = httpx.Timeout(float(os.getenv("GATEWAY_UPSTREAM_TIMEOUT_SECONDS", "60")))
+    timeout = httpx.Timeout(float(os.getenv("GATEWAY_UPSTREAM_TIMEOUT_SECONDS", "180")))
 
     if isinstance(parsed, dict) and bool(parsed.get("stream")):
         stream, status_code, response_headers = await _stream_upstream_response(
