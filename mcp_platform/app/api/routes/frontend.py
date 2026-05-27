@@ -739,6 +739,7 @@ async def list_miners_by_competition(
             detail="Competition not found",
         )
 
+    is_swe_competition = "swe" in comp_name.lower()
     show_partial_scores = await _get_is_partial_winner(db, comp_id)
 
     total_value = int(
@@ -787,6 +788,18 @@ async def list_miners_by_competition(
         )
     ).all()
 
+    swe_scores_by_hotkey: dict[str, float | None] = {}
+    if is_swe_competition and rows:
+        swe_rows = await _fetch_swe_rows(db, comp_id=comp_id)
+        swe_miner_rows: dict[str, list[sa.Row]] = {}
+        for swe_row in swe_rows:
+            swe_miner_rows.setdefault(str(swe_row.hotkey), []).append(swe_row)
+
+        swe_scores_by_hotkey = {
+            hotkey: build_swe_miner_scores(build_swe_task_groups(task_rows))[0]
+            for hotkey, task_rows in swe_miner_rows.items()
+        }
+
     miners = []
     for r in rows:
         miner_st = r.status or "in queue"
@@ -804,6 +817,7 @@ async def list_miners_by_competition(
             MinerListItem(
                 hotkey=r.ss58,
                 score=competition_score,
+                total_score=swe_scores_by_hotkey.get(str(r.ss58)) if is_swe_competition else None,
                 partial_scores=competition_partial_scores,
                 last_submit=r.last_submit_at,
                 status=miner_st,
