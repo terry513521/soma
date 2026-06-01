@@ -455,6 +455,46 @@ async def _fetch_swe_rows(
     return list(result)
 
 
+async def _resolve_swe_task_id(
+    db: AsyncSession,
+    *,
+    comp_id: int,
+    task_name: str,
+) -> int:
+    task_id = await db.scalar(
+        select(SWE_BENCH_TASKS.c.id)
+        .where(SWE_BENCH_TASKS.c.competition_fk == comp_id)
+        .where(SWE_BENCH_TASKS.c.instance_id == task_name)
+        .limit(1)
+    )
+    if task_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Task not found",
+        )
+    return int(task_id)
+
+
+async def _resolve_swe_task_id_or_name(
+    db: AsyncSession,
+    *,
+    comp_id: int,
+    task_name: str,
+) -> int:
+    if task_name.isdigit():
+        task_id = int(task_name)
+        exists = await db.scalar(
+            select(SWE_BENCH_TASKS.c.id)
+            .where(SWE_BENCH_TASKS.c.competition_fk == comp_id)
+            .where(SWE_BENCH_TASKS.c.id == task_id)
+            .limit(1)
+        )
+        if exists is not None:
+            return task_id
+
+    return await _resolve_swe_task_id(db, comp_id=comp_id, task_name=task_name)
+
+
 def _required_screener_task_passes(total_screener_tasks: int) -> int:
     if total_screener_tasks <= 0:
         return 0
@@ -2041,7 +2081,8 @@ async def get_swe_miner_task_result(
         eval_ends_at = eval_ends_at.replace(tzinfo=timezone.utc)
     competition_finished = eval_ends_at is not None and datetime.now(timezone.utc) >= eval_ends_at
 
-    rows = await _fetch_swe_rows(db, comp_id=comp_id, hotkey=hotkey, task_name=task_name)
+    task_id = await _resolve_swe_task_id_or_name(db, comp_id=comp_id, task_name=task_name)
+    rows = await _fetch_swe_rows(db, comp_id=comp_id, hotkey=hotkey, task_id=task_id)
     if not rows:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -2089,7 +2130,8 @@ async def get_swe_miner_task_runs(
         eval_ends_at = eval_ends_at.replace(tzinfo=timezone.utc)
     competition_finished = eval_ends_at is not None and datetime.now(timezone.utc) >= eval_ends_at
 
-    rows = await _fetch_swe_rows(db, comp_id=comp_id, hotkey=hotkey, task_name=task_name)
+    task_id = await _resolve_swe_task_id_or_name(db, comp_id=comp_id, task_name=task_name)
+    rows = await _fetch_swe_rows(db, comp_id=comp_id, hotkey=hotkey, task_id=task_id)
     if not rows:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
