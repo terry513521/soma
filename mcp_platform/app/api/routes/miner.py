@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 
 from sqlalchemy import select, text
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.exceptions import RequestValidationError
+from fastapi.routing import APIRoute
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_script_storage, verify_miner_request_dep_tz
@@ -45,7 +47,44 @@ from app.core.logging import get_logger
 
 logger = get_logger(__name__)
 
-router = APIRouter(tags=["miner"])
+
+def _sanitized_miner_error_detail(request: Request, exc: HTTPException) -> str:
+    # Keep miner errors sanitized by default, but provide a targeted hint
+    # for the common OpenRouter update flow mistake.
+    if (
+        exc.status_code == status.HTTP_404_NOT_FOUND
+        and request.url.path.endswith("/miner/openrouter-key/update")
+    ):
+        return (
+            "OpenRouter key not found for miner. "
+            "Add it first via /miner/openrouter-key/add."
+        )
+    return ""
+
+
+class _MinerSanitizedRoute(APIRoute):
+    def get_route_handler(self):
+        original_route_handler = super().get_route_handler()
+
+        async def custom_route_handler(request: Request):
+            try:
+                return await original_route_handler(request)
+            except HTTPException as exc:
+                raise HTTPException(
+                    status_code=exc.status_code,
+                    detail=_sanitized_miner_error_detail(request, exc),
+                    headers=exc.headers,
+                ) from exc
+            except RequestValidationError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="",
+                ) from exc
+
+        return custom_route_handler
+
+
+router = APIRouter(tags=["miner"], route_class=_MinerSanitizedRoute)
 
 
 async def _log_error_response(

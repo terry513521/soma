@@ -20,6 +20,7 @@ from app.db.interfaces.burn_weight_queries import (
     get_latest_burn_request_row,
 )
 from app.db.interfaces.competition_queries import (
+    get_active_competition_id_direct,
     get_active_competition_id_from_view,
     get_active_competition_phase_row,
 )
@@ -296,6 +297,10 @@ async def _log_error_response(
 
 
 async def _get_active_competition_id(db: AsyncSession) -> int | None:
+    now = datetime.now(timezone.utc)
+    result = await get_active_competition_id_direct(db, now=now)
+    if result is not None:
+        return result
     return await get_active_competition_id_from_view(db)
 
 

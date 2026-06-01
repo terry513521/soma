@@ -15,9 +15,6 @@ from app.core.config import settings
 from app.core.logging import get_logger
 from app.services.blob.s3 import S3BlobStorage
 from app.services.sandbox.remote_compact_bench_manager import RemoteCompactBenchManager
-from soma_shared.db.models.miner import Miner
-from soma_shared.db.models.miner_upload import MinerUpload
-from soma_shared.db.models.script import Script
 from soma_shared.db.models.swe_bench_run import SweBenchRun
 from soma_shared.db.models.swe_bench_run_validation import SweBenchRunValidation
 from soma_shared.db.models.swe_bench_task import SweBenchTask
@@ -44,6 +41,34 @@ class _ScriptRef:
     miner_fk: int
 
 
+def _non_baseline_eligibility_sql(
+    *,
+    script_fk_expr: str,
+    miner_fk_expr: str,
+    competition_fk_expr: str | None = None,
+) -> str:
+    competition_filter = (
+        f"\n                      AND mu.competition_fk = {competition_fk_expr}"
+        if competition_fk_expr is not None
+        else ""
+    )
+    return (
+        f"""
+                    EXISTS (
+                        SELECT 1
+                        FROM miner_uploads mu
+                        WHERE mu.script_fk = {script_fk_expr}{competition_filter}
+                    )
+                    AND EXISTS (
+                        SELECT 1
+                        FROM miner_openrouter_api_keys mok
+                        WHERE mok.miner_fk = {miner_fk_expr}
+                          AND mok.revoked_at IS NULL
+                    )
+        """
+    ).strip()
+
+
 def start_swebench_orchestrator_task(app) -> None:
     interval = max(0.5, float(settings.swebench_orchestrator_interval_seconds))
     task = asyncio.create_task(_run_orchestrator_loop(app, interval))
@@ -53,6 +78,7 @@ def start_swebench_orchestrator_task(app) -> None:
         extra={
             "interval_seconds": interval,
             "dispatch_batch_size": int(settings.swebench_dispatch_batch_size),
+            "dispatch_strict_fifo": bool(settings.swebench_dispatch_strict_fifo),
         },
     )
 
@@ -310,10 +336,8 @@ async def _seed_runs_for_competition(
     if not baseline_complete:
         return created
 
-    if screener_task_count > 0 and not await _competition_has_non_baseline_runs(
-        db,
-        competition_id=competition_id,
-    ):
+    has_selected_screener_tasks = any(bool(task.is_screener) for task in tasks)
+    if screener_task_count > 0 and not has_selected_screener_tasks:
         await _select_dynamic_screener_tasks(
             db,
             tasks=tasks,
@@ -345,29 +369,6 @@ def _resolve_screener_task_count(tasks: list[SweBenchTask]) -> int:
         return min(len(tasks), int(preset_count))
     configured = max(0, int(getattr(settings, "swebench_dynamic_screener_task_count", 0)))
     return min(len(tasks), configured)
-
-
-async def _competition_has_non_baseline_runs(
-    db: AsyncSession,
-    *,
-    competition_id: int,
-) -> bool:
-    row = (
-        await db.execute(
-            text(
-                """
-                SELECT 1
-                FROM swe_bench_runs r
-                JOIN swe_bench_tasks t ON t.id = r.task_fk
-                WHERE t.competition_fk = :competition_id
-                  AND r.baseline_run = FALSE
-                LIMIT 1
-                """
-            ),
-            {"competition_id": int(competition_id)},
-        )
-    ).first()
-    return row is not None
 
 
 async def _is_baseline_evaluation_complete(
@@ -460,18 +461,26 @@ async def _load_latest_scripts_for_competition(
     db: AsyncSession,
     competition_id: int,
 ) -> list[_ScriptRef]:
+    eligibility_sql = _non_baseline_eligibility_sql(
+        script_fk_expr="s.id",
+        miner_fk_expr="m.id",
+        competition_fk_expr=":competition_id",
+    )
     rows = (
         await db.execute(
-            select(
-                Script.id,
-                Script.miner_fk,
-                MinerUpload.created_at,
-            )
-            .join(MinerUpload, MinerUpload.script_fk == Script.id)
-            .join(Miner, Miner.id == Script.miner_fk)
-            .where(MinerUpload.competition_fk == competition_id)
-            .where(Miner.miner_banned_status.is_(False))
-            .order_by(MinerUpload.created_at.desc())
+            text(
+                """
+                SELECT s.id, s.miner_fk, u.created_at
+                FROM scripts s
+                JOIN miner_uploads u ON u.script_fk = s.id
+                JOIN miners m ON m.id = s.miner_fk
+                WHERE u.competition_fk = :competition_id
+                  AND m.miner_banned_status = FALSE
+                  AND {eligibility_sql}
+                ORDER BY u.created_at DESC
+                """.format(eligibility_sql=eligibility_sql)
+            ),
+            {"competition_id": int(competition_id)},
         )
     ).all()
 
@@ -739,10 +748,20 @@ async def _dispatch_due_runs(
     global_not_before: float = float(getattr(app.state, "swebench_global_retry_not_before", 0.0))
     app.state.swebench_retry_not_before = retry_not_before
     app.state.swebench_retry_attempts = retry_attempts
+    eligibility_sql = _non_baseline_eligibility_sql(
+        script_fk_expr="r.script_fk",
+        miner_fk_expr="r.miner_fk",
+        competition_fk_expr="t.competition_fk",
+    )
 
     async for db in get_db_session():
-        batch_size = max(1, int(settings.swebench_dispatch_batch_size))
-        fetch_limit = min(200, batch_size * 5)
+        strict_fifo_dispatch = bool(settings.swebench_dispatch_strict_fifo)
+        batch_size = (
+            1
+            if strict_fifo_dispatch
+            else max(1, int(settings.swebench_dispatch_batch_size))
+        )
+        fetch_limit = min(200, batch_size if strict_fifo_dispatch else batch_size * 5)
         due_rows = (
             await db.execute(
                 text(
@@ -754,6 +773,15 @@ async def _dispatch_due_runs(
                         r.miner_fk,
                         r.script_fk,
                         r.baseline_run,
+                        CASE
+                            WHEN r.baseline_run = TRUE THEN NULL
+                            ELSE (
+                                SELECT MIN(mu.created_at)
+                                FROM miner_uploads mu
+                                WHERE mu.script_fk = r.script_fk
+                                  AND mu.competition_fk = t.competition_fk
+                            )
+                        END AS miner_upload_created_at,
                         t.id AS task_id,
                         t.competition_fk,
                         t.instance_id,
@@ -762,10 +790,18 @@ async def _dispatch_due_runs(
                     FROM swe_bench_runs r
                     JOIN swe_bench_tasks t ON t.id = r.task_fk
                     WHERE r.status = 'pending'
-                    ORDER BY r.created_at ASC
+                      AND (
+                          r.baseline_run = TRUE
+                          OR ({eligibility_sql})
+                      )
+                    ORDER BY
+                        CASE WHEN r.baseline_run = TRUE THEN 0 ELSE 1 END ASC,
+                        miner_upload_created_at ASC NULLS LAST,
+                        r.created_at ASC,
+                        r.id ASC
                     FOR UPDATE SKIP LOCKED
                     LIMIT :limit
-                    """
+                    """.format(eligibility_sql=eligibility_sql)
                 ),
                 {"limit": fetch_limit},
             )
@@ -800,9 +836,12 @@ async def _dispatch_due_runs(
             retry_at = retry_not_before.get(run_id)
             if retry_at is not None and retry_at > now_monotonic:
                 deferred_by_cooldown += 1
+                if strict_fifo_dispatch:
+                    # Preserve strict queue order: do not bypass a cooling head run.
+                    break
                 continue
             dispatch_rows.append(row)
-            if len(dispatch_rows) >= batch_size:
+            if strict_fifo_dispatch or len(dispatch_rows) >= batch_size:
                 break
 
         if not dispatch_rows:
@@ -814,15 +853,26 @@ async def _dispatch_due_runs(
 
         for row in dispatch_rows:
             run_id = int(row["run_id"])
-            script_presigned_url = await _resolve_script_presigned_url(
-                db=db,
-                app=app,
-                s3_storage=s3_storage,
-                expires_in=expires_in,
-                script_fk=row.get("script_fk"),
-                miner_fk=row.get("miner_fk"),
-                baseline_run=bool(row["baseline_run"]),
-            )
+            try:
+                script_presigned_url = await _resolve_script_presigned_url(
+                    db=db,
+                    app=app,
+                    s3_storage=s3_storage,
+                    expires_in=expires_in,
+                    script_fk=row.get("script_fk"),
+                    miner_fk=row.get("miner_fk"),
+                    competition_fk=row.get("competition_fk"),
+                    baseline_run=bool(row["baseline_run"]),
+                )
+            except LookupError as exc:
+                await db.execute(
+                    text(
+                        "UPDATE swe_bench_runs SET status = 'pending', last_error = :error, updated_at = now() WHERE id = :run_id"
+                    ),
+                    {"run_id": run_id, "error": str(exc)},
+                )
+                deferred += 1
+                continue
 
             ok, error, retryable = await manager.dispatch_swebench_run(
                 run_id=run_id,
@@ -904,12 +954,21 @@ async def _resolve_script_presigned_url(
     expires_in: int,
     script_fk,
     miner_fk,
+    competition_fk,
     baseline_run: bool,
 ) -> str:
+    if not baseline_run and not competition_fk:
+        raise LookupError(
+            "Miner script is not eligible for sandbox dispatch "
+            "(requires miner upload and active OpenRouter key)."
+        )
+
     script_context = await _load_script_dispatch_context(
         db=db,
         script_fk=script_fk,
         miner_fk=miner_fk,
+        competition_fk=int(competition_fk) if competition_fk is not None else None,
+        require_active_openrouter_key=not baseline_run,
     )
     if script_context is not None:
         script_uuid, script_created_at, miner_ss58 = script_context
@@ -926,6 +985,11 @@ async def _resolve_script_presigned_url(
             key,
             "get_object",
             expires_in=expires_in,
+        )
+    if not baseline_run:
+        raise LookupError(
+            "Miner script is not eligible for sandbox dispatch "
+            "(requires miner upload and active OpenRouter key)."
         )
     return await _get_baseline_script_presigned_url(
         app=app,
@@ -974,9 +1038,26 @@ async def _load_script_dispatch_context(
     db: AsyncSession,
     script_fk,
     miner_fk,
+    competition_fk: int | None = None,
+    require_active_openrouter_key: bool = False,
 ) -> tuple[str, datetime | None, str] | None:
     if not script_fk or not miner_fk:
         return None
+
+    if competition_fk is None:
+        return None
+
+    key_filter = (
+        "AND EXISTS (SELECT 1 FROM miner_openrouter_api_keys mok "
+        "WHERE mok.miner_fk = m.id AND mok.revoked_at IS NULL)"
+        if require_active_openrouter_key
+        else ""
+    )
+    params: dict[str, int] = {
+        "script_fk": int(script_fk),
+        "miner_fk": int(miner_fk),
+        "competition_fk": int(competition_fk),
+    }
 
     row = (
         await db.execute(
@@ -985,12 +1066,16 @@ async def _load_script_dispatch_context(
                 SELECT s.script_uuid, s.created_at, m.ss58
                 FROM scripts s
                 JOIN miners m ON m.id = s.miner_fk
+                JOIN miner_uploads u ON u.script_fk = s.id
                 WHERE s.id = :script_fk
                   AND m.id = :miner_fk
+                  AND u.competition_fk = :competition_fk
+                  {key_filter}
+                ORDER BY u.created_at DESC
                 LIMIT 1
-                """
+                """.format(key_filter=key_filter)
             ),
-            {"script_fk": int(script_fk), "miner_fk": int(miner_fk)},
+            params,
         )
     ).first()
     if not row:
