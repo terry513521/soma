@@ -88,7 +88,7 @@ from app.api.routes.utils import (
 logger = get_logger(__name__)
 _cache = Cache(Cache.MEMORY)
 _rate_limit_cache = Cache(Cache.MEMORY, namespace="frontend_api_key_rate_limit")
-TEXT_HIDDEN_PLACEHOLDER = "Will be available after upload window"
+TEXT_HIDDEN_PLACEHOLDER = "Will be available after uploads finish"
 API_KEY_HEADER = "x-api-key"
 
 SWE_BENCH_TASKS = sa.table(
@@ -97,6 +97,7 @@ SWE_BENCH_TASKS = sa.table(
     sa.column("competition_fk"),
     sa.column("instance_id"),
     sa.column("is_screener"),
+    sa.column("planned_repeats"),
 )
 
 SWE_BENCH_RUNS = sa.table(
@@ -110,6 +111,7 @@ SWE_BENCH_RUNS = sa.table(
     sa.column("time_taken_seconds"),
     sa.column("agent_steps"),
     sa.column("baseline_run"),
+    sa.column("status"),
 )
 
 SWE_BENCH_RUN_VALIDATIONS = sa.table(
@@ -117,6 +119,21 @@ SWE_BENCH_RUN_VALIDATIONS = sa.table(
     sa.column("id"),
     sa.column("run_fk"),
     sa.column("resolved"),
+    sa.column("scored_at"),
+)
+
+MINER_OPENROUTER_API_KEYS = sa.table(
+    "miner_openrouter_api_keys",
+    sa.column("miner_fk"),
+    sa.column("revoked_at"),
+)
+
+MINER_UPLOADS = sa.table(
+    "miner_uploads",
+    sa.column("id"),
+    sa.column("script_fk"),
+    sa.column("competition_fk"),
+    sa.column("created_at"),
 )
 
 
@@ -438,6 +455,248 @@ async def _fetch_swe_rows(
     return list(result)
 
 
+def _required_screener_task_passes(total_screener_tasks: int) -> int:
+    if total_screener_tasks <= 0:
+        return 0
+
+    ratio = float(settings.swebench_screening_pass_ratio)
+    ratio = min(1.0, max(0.0, ratio))
+    ratio_required = int(ceil(total_screener_tasks * ratio))
+    min_required = max(0, int(settings.swebench_screening_min_passed_tasks))
+    required = max(1, max(ratio_required, min_required))
+    return min(total_screener_tasks, required)
+
+
+async def _build_swe_status_overrides(
+    db: AsyncSession,
+    *,
+    comp_id: int,
+    hotkeys: set[str],
+) -> dict[str, str]:
+    if comp_id < 75 or not hotkeys:
+        return {}
+
+    page_miners_sq = (
+        select(
+            Miner.id.label("miner_fk"),
+            Miner.ss58.label("ss58"),
+        )
+        .where(Miner.ss58.in_(hotkeys))
+        .subquery("page_miners")
+    )
+    latest_scripts_sq = (
+        select(
+            Script.miner_fk.label("miner_fk"),
+            Script.id.label("script_fk"),
+            func.row_number()
+            .over(
+                partition_by=Script.miner_fk,
+                order_by=(MINER_UPLOADS.c.created_at.desc(), MINER_UPLOADS.c.id.desc()),
+            )
+            .label("rn"),
+        )
+        .select_from(Script)
+        .join(MINER_UPLOADS, MINER_UPLOADS.c.script_fk == Script.id)
+        .join(page_miners_sq, page_miners_sq.c.miner_fk == Script.miner_fk)
+        .where(MINER_UPLOADS.c.competition_fk == comp_id)
+        .subquery("latest_scripts")
+    )
+    active_key_exists = (
+        select(sa.literal(1))
+        .select_from(MINER_OPENROUTER_API_KEYS)
+        .where(MINER_OPENROUTER_API_KEYS.c.miner_fk == page_miners_sq.c.miner_fk)
+        .where(MINER_OPENROUTER_API_KEYS.c.revoked_at.is_(None))
+        .exists()
+    )
+    miner_script_rows = (
+        await db.execute(
+            select(
+                page_miners_sq.c.ss58,
+                page_miners_sq.c.miner_fk,
+                latest_scripts_sq.c.script_fk,
+                active_key_exists.label("has_active_key"),
+            )
+            .select_from(page_miners_sq)
+            .outerjoin(
+                latest_scripts_sq,
+                and_(
+                    latest_scripts_sq.c.miner_fk == page_miners_sq.c.miner_fk,
+                    latest_scripts_sq.c.rn == 1,
+                ),
+            )
+        )
+    ).all()
+
+    status_by_hotkey: dict[str, str] = {}
+    script_refs: dict[str, tuple[int, int]] = {}
+    for row in miner_script_rows:
+        ss58 = str(row.ss58)
+        miner_fk = int(row.miner_fk)
+        has_active_key = bool(row.has_active_key)
+        script_fk = int(row.script_fk) if row.script_fk is not None else None
+        if not has_active_key:
+            status_by_hotkey[ss58] = "no api key"
+            continue
+        if script_fk is not None:
+            script_refs[ss58] = (miner_fk, script_fk)
+
+    if not script_refs:
+        return status_by_hotkey
+
+    task_rows = (
+        await db.execute(
+            select(
+                SWE_BENCH_TASKS.c.id,
+                SWE_BENCH_TASKS.c.is_screener,
+                SWE_BENCH_TASKS.c.planned_repeats,
+            )
+            .where(SWE_BENCH_TASKS.c.competition_fk == comp_id)
+        )
+    ).all()
+    if not task_rows:
+        return status_by_hotkey
+
+    task_repeats: dict[int, int] = {}
+    screener_task_ids: list[int] = []
+    expected_full_runs = 0
+    for task_row in task_rows:
+        task_id = int(task_row.id)
+        repeats = max(1, int(task_row.planned_repeats or 1))
+        task_repeats[task_id] = repeats
+        expected_full_runs += repeats
+        if bool(task_row.is_screener):
+            screener_task_ids.append(task_id)
+
+    pairs = list(script_refs.values())
+    pair_expr = sa.tuple_(SWE_BENCH_RUNS.c.miner_fk, SWE_BENCH_RUNS.c.script_fk)
+    run_rows = (
+        await db.execute(
+            select(
+                SWE_BENCH_RUNS.c.id.label("run_id"),
+                SWE_BENCH_RUNS.c.miner_fk,
+                SWE_BENCH_RUNS.c.script_fk,
+                SWE_BENCH_RUNS.c.task_fk,
+                SWE_BENCH_RUNS.c.attempt_no,
+                SWE_BENCH_RUNS.c.status,
+                SWE_BENCH_TASKS.c.is_screener,
+                SWE_BENCH_RUN_VALIDATIONS.c.resolved,
+                SWE_BENCH_RUN_VALIDATIONS.c.scored_at,
+            )
+            .select_from(SWE_BENCH_RUNS)
+            .join(SWE_BENCH_TASKS, SWE_BENCH_TASKS.c.id == SWE_BENCH_RUNS.c.task_fk)
+            .outerjoin(
+                SWE_BENCH_RUN_VALIDATIONS,
+                SWE_BENCH_RUN_VALIDATIONS.c.run_fk == SWE_BENCH_RUNS.c.id,
+            )
+            .where(SWE_BENCH_TASKS.c.competition_fk == comp_id)
+            .where(SWE_BENCH_RUNS.c.baseline_run.is_(False))
+            .where(pair_expr.in_(pairs))
+        )
+    ).all()
+
+    stats_by_pair: dict[
+        tuple[int, int],
+        dict[
+            str,
+            bool | set[int] | dict[tuple[int, int], tuple[bool | None, datetime | None]],
+        ],
+    ] = {}
+    for row in run_rows:
+        key = (int(row.miner_fk), int(row.script_fk))
+        stats = stats_by_pair.setdefault(
+            key,
+            {
+                "has_dispatched_screener": False,
+                "has_dispatched_non_screener": False,
+                "scored_run_ids": set(),
+                "screener_states": {},
+            },
+        )
+        is_screener = bool(row.is_screener)
+        if row.status == "dispatched":
+            if is_screener:
+                stats["has_dispatched_screener"] = True
+            else:
+                stats["has_dispatched_non_screener"] = True
+        if row.scored_at is not None and row.resolved is not None:
+            scored_ids = stats["scored_run_ids"]
+            if isinstance(scored_ids, set):
+                scored_ids.add(int(row.run_id))
+        if is_screener:
+            states = stats["screener_states"]
+            if isinstance(states, dict):
+                states[(int(row.task_fk), int(row.attempt_no))] = (
+                    bool(row.resolved) if row.resolved is not None else None,
+                    row.scored_at,
+                )
+
+    required_screener_passes = _required_screener_task_passes(len(screener_task_ids))
+    for ss58, pair in script_refs.items():
+        if status_by_hotkey.get(ss58) == "no api key":
+            continue
+
+        pair_stats = stats_by_pair.get(
+            pair,
+            {
+                "has_dispatched_screener": False,
+                "has_dispatched_non_screener": False,
+                "scored_run_ids": set(),
+                "screener_states": {},
+            },
+        )
+        scored_ids = pair_stats["scored_run_ids"]
+        fully_scored = (
+            expected_full_runs > 0
+            and isinstance(scored_ids, set)
+            and len(scored_ids) >= expected_full_runs
+        )
+
+        screening_complete = True
+        screening_passed = True
+        if screener_task_ids:
+            screening_complete = True
+            screening_passed_count = 0
+            states = pair_stats["screener_states"]
+            screener_states: dict[tuple[int, int], tuple[bool | None, datetime | None]] = (
+                states if isinstance(states, dict) else {}
+            )
+            for task_id in screener_task_ids:
+                repeats = max(1, int(task_repeats.get(task_id, 1)))
+                attempt_resolved: list[bool] = []
+                for attempt_no in range(1, repeats + 1):
+                    state = screener_states.get((task_id, attempt_no))
+                    if state is None:
+                        screening_complete = False
+                        screening_passed = False
+                        break
+                    resolved_value, scored_at = state
+                    if scored_at is None or resolved_value is None:
+                        screening_complete = False
+                        screening_passed = False
+                        break
+                    attempt_resolved.append(bool(resolved_value))
+                if not screening_complete:
+                    break
+                if sum(1 for value in attempt_resolved if value) > (len(attempt_resolved) // 2):
+                    screening_passed_count += 1
+            if screening_complete:
+                screening_passed = screening_passed_count >= required_screener_passes
+
+        has_dispatched_non_screener = bool(pair_stats["has_dispatched_non_screener"])
+        has_dispatched_screener = bool(pair_stats["has_dispatched_screener"])
+
+        if fully_scored:
+            status_by_hotkey[ss58] = "scored"
+        elif has_dispatched_non_screener:
+            status_by_hotkey[ss58] = "evaluating"
+        elif has_dispatched_screener:
+            status_by_hotkey[ss58] = "screening"
+        elif screening_complete and not screening_passed:
+            status_by_hotkey[ss58] = "not qualified"
+
+    return status_by_hotkey
+
+
 async def _log_frontend_request_metrics(request: Request, status_code: int) -> None:
     request_id = getattr(request.state, "request_id", None)
     if not request_id:
@@ -599,11 +858,21 @@ async def get_active_competitions(
     request: Request,
     db: AsyncSession = Depends(get_db_session),
 ) -> list[MinerCompetitionItem]:
+    has_swe_tasks = (
+        select(SWE_BENCH_TASKS.c.id)
+        .where(SWE_BENCH_TASKS.c.competition_fk == Competition.id)
+        .exists()
+    )
+
     rows = (
         await db.execute(
             select(
                 Competition.id.label("competition_id"),
                 Competition.competition_name,
+                sa.case(
+                    (has_swe_tasks, "swe"),
+                    else_="compression",
+                ).label("competition_type"),
             ).order_by(Competition.id.asc())
         )
     ).all()
@@ -612,6 +881,7 @@ async def get_active_competitions(
         MinerCompetitionItem(
             competition_id=int(row.competition_id),
             competition_name=row.competition_name,
+            competition_type=str(row.competition_type),
         )
         for row in rows
     ]
@@ -800,9 +1070,16 @@ async def list_miners_by_competition(
             for hotkey, task_rows in swe_miner_rows.items()
         }
 
+    status_overrides = await _build_swe_status_overrides(
+        db,
+        comp_id=comp_id,
+        hotkeys={str(r.ss58) for r in rows if r.ss58},
+    )
+
     miners = []
     for r in rows:
-        miner_st = r.status or "in queue"
+        base_miner_st = r.status or "in queue"
+        miner_st = status_overrides.get(str(r.ss58), base_miner_st)
         competition_score = (
             float(r.total_score)
             if r.total_score is not None and miner_st in {"scored", "evaluating"}
@@ -921,7 +1198,13 @@ async def get_miner_by_competition(
             detail="Competition not found",
         )
 
-    miner_st = row.status or "in queue"
+    status_overrides = await _build_swe_status_overrides(
+        db,
+        comp_id=comp_id,
+        hotkeys={str(hotkey)},
+    )
+    base_miner_st = row.status or "in queue"
+    miner_st = status_overrides.get(str(hotkey), base_miner_st)
 
     show_score = miner_st in {"scored", "evaluating"} and eval_started
     contest_partial_scores = (
@@ -1059,9 +1342,16 @@ async def get_miner_contest_challenge_detail(
         select(V_ACTIVE_COMPETITION.c.eval_starts_at)
         .where(V_ACTIVE_COMPETITION.c.competition_id == competition_id)
     )
+    eval_ends_at = await db.scalar(
+        select(V_ACTIVE_COMPETITION.c.eval_ends_at)
+        .where(V_ACTIVE_COMPETITION.c.competition_id == competition_id)
+    )
     if eval_starts_at is not None and eval_starts_at.tzinfo is None:
         eval_starts_at = eval_starts_at.replace(tzinfo=timezone.utc)
+    if eval_ends_at is not None and eval_ends_at.tzinfo is None:
+        eval_ends_at = eval_ends_at.replace(tzinfo=timezone.utc)
     eval_started = eval_starts_at is not None and datetime.now(timezone.utc) >= eval_starts_at
+    competition_finished = eval_ends_at is not None and datetime.now(timezone.utc) >= eval_ends_at
 
     questions_data = (
         await db.execute(
@@ -1121,7 +1411,9 @@ async def get_miner_contest_challenge_detail(
         challenge=ChallengeDetail(
             batch_challenge_id=batch_challenge_id,
             challenge_id=challenge.id,
-            challenge_name=challenge.challenge_name,
+            challenge_name=(
+                TEXT_HIDDEN_PLACEHOLDER if not competition_finished else challenge.challenge_name
+            ),
             challenge_text=TEXT_HIDDEN_PLACEHOLDER if not eval_started else challenge.challenge_text,
             competition_name=competition_name,
             competition_id=competition_id,
@@ -1161,12 +1453,19 @@ async def get_miner_competition_challenges(
         select(V_ACTIVE_COMPETITION.c.eval_starts_at)
         .where(V_ACTIVE_COMPETITION.c.competition_id == comp_id)
     )
+    eval_ends_at = await db.scalar(
+        select(V_ACTIVE_COMPETITION.c.eval_ends_at)
+        .where(V_ACTIVE_COMPETITION.c.competition_id == comp_id)
+    )
     if eval_starts_at is None:
         return MinerChallengesResponse(challenges=[], total=0)
     if eval_starts_at.tzinfo is None:
         eval_starts_at = eval_starts_at.replace(tzinfo=timezone.utc)
+    if eval_ends_at is not None and eval_ends_at.tzinfo is None:
+        eval_ends_at = eval_ends_at.replace(tzinfo=timezone.utc)
     if datetime.now(timezone.utc) < eval_starts_at:
         return MinerChallengesResponse(challenges=[], total=0)
+    competition_finished = eval_ends_at is not None and datetime.now(timezone.utc) >= eval_ends_at
 
     rows = (
         await db.execute(
@@ -1236,7 +1535,9 @@ async def get_miner_competition_challenges(
     challenges = [
         ChallengeItem(
             challenge_id=r.challenge_id,
-            challenge_name=r.challenge_name,
+            challenge_name=(
+                TEXT_HIDDEN_PLACEHOLDER if not competition_finished else r.challenge_name
+            ),
             batch_challenge_id=r.batch_challenge_id,
             competition_name=r.competition_name,
             competition_id=r.competition_id,
@@ -1346,7 +1647,7 @@ async def get_miner_competition(
 
     await _cache.set(cache_key, response, ttl=15)
     logger.info(
-        f"[Frontend] Miner competition: comp_id={comp_id}, hotkey={hotkey}, ",
+        f"[Frontend] Miner competition: comp_id={comp_id}, hotkey={hotkey}, "
         f"total_score={row.total_score}, rank={row.rank}"
     )
 
@@ -1432,12 +1733,19 @@ async def get_miner_screener_challenges(
         select(V_ACTIVE_COMPETITION.c.upload_starts_at)
         .where(V_ACTIVE_COMPETITION.c.competition_id == comp_id)
     )
+    eval_ends_at = await db.scalar(
+        select(V_ACTIVE_COMPETITION.c.eval_ends_at)
+        .where(V_ACTIVE_COMPETITION.c.competition_id == comp_id)
+    )
     if upload_starts_at is None:
         return MinerChallengesResponse(challenges=[], total=0)
     if upload_starts_at.tzinfo is None:
         upload_starts_at = upload_starts_at.replace(tzinfo=timezone.utc)
+    if eval_ends_at is not None and eval_ends_at.tzinfo is None:
+        eval_ends_at = eval_ends_at.replace(tzinfo=timezone.utc)
     if datetime.now(timezone.utc) < upload_starts_at:
         return MinerChallengesResponse(challenges=[], total=0)
+    competition_finished = eval_ends_at is not None and datetime.now(timezone.utc) >= eval_ends_at
 
     rows = (
         await db.execute(
@@ -1514,7 +1822,9 @@ async def get_miner_screener_challenges(
     challenges = [
         ChallengeItem(
             challenge_id=r.challenge_id,
-            challenge_name=r.challenge_name,
+            challenge_name=(
+                TEXT_HIDDEN_PLACEHOLDER if not competition_finished else r.challenge_name
+            ),
             batch_challenge_id=r.batch_challenge_id,
             competition_name=r.competition_name,
             competition_id=r.competition_id,
@@ -1678,6 +1988,14 @@ async def get_swe_miner_task_results(
     db: AsyncSession = Depends(get_db_session),
 ) -> SweMinerTaskResultsResponse:
     await _ensure_competition_exists(db, comp_id)
+    eval_ends_at = await db.scalar(
+        select(V_ACTIVE_COMPETITION.c.eval_ends_at)
+        .where(V_ACTIVE_COMPETITION.c.competition_id == comp_id)
+    )
+    if eval_ends_at is not None and eval_ends_at.tzinfo is None:
+        eval_ends_at = eval_ends_at.replace(tzinfo=timezone.utc)
+    competition_finished = eval_ends_at is not None and datetime.now(timezone.utc) >= eval_ends_at
+
     rows = await _fetch_swe_rows(db, comp_id=comp_id, hotkey=hotkey)
     if not rows:
         raise HTTPException(
@@ -1686,7 +2004,18 @@ async def get_swe_miner_task_results(
         )
 
     task_groups = build_swe_task_groups(rows)
-    tasks = [build_swe_task_result_item(group) for group in task_groups.values()]
+    tasks = [
+        build_swe_task_result_item(group).model_copy(
+            update={
+                "task_name": (
+                    group["task_name"]
+                    if competition_finished
+                    else TEXT_HIDDEN_PLACEHOLDER
+                )
+            }
+        )
+        for group in task_groups.values()
+    ]
     tasks.sort(key=lambda item: item.task_name)
 
     return SweMinerTaskResultsResponse(tasks=tasks, total=len(tasks))
@@ -1704,6 +2033,14 @@ async def get_swe_miner_task_result(
     db: AsyncSession = Depends(get_db_session),
 ) -> SweMinerTaskDetailResponse:
     await _ensure_competition_exists(db, comp_id)
+    eval_ends_at = await db.scalar(
+        select(V_ACTIVE_COMPETITION.c.eval_ends_at)
+        .where(V_ACTIVE_COMPETITION.c.competition_id == comp_id)
+    )
+    if eval_ends_at is not None and eval_ends_at.tzinfo is None:
+        eval_ends_at = eval_ends_at.replace(tzinfo=timezone.utc)
+    competition_finished = eval_ends_at is not None and datetime.now(timezone.utc) >= eval_ends_at
+
     rows = await _fetch_swe_rows(db, comp_id=comp_id, hotkey=hotkey, task_name=task_name)
     if not rows:
         raise HTTPException(
@@ -1719,7 +2056,17 @@ async def get_swe_miner_task_result(
             detail="Task not found for this miner",
         )
 
-    return SweMinerTaskDetailResponse(task=build_swe_task_result_item(task_group))
+    return SweMinerTaskDetailResponse(
+        task=build_swe_task_result_item(task_group).model_copy(
+            update={
+                "task_name": (
+                    task_group["task_name"]
+                    if competition_finished
+                    else TEXT_HIDDEN_PLACEHOLDER
+                )
+            }
+        )
+    )
 
 
 @frontend_router.get(
@@ -1734,6 +2081,14 @@ async def get_swe_miner_task_runs(
     db: AsyncSession = Depends(get_db_session),
 ) -> SweMinerTaskRunsResponse:
     await _ensure_competition_exists(db, comp_id)
+    eval_ends_at = await db.scalar(
+        select(V_ACTIVE_COMPETITION.c.eval_ends_at)
+        .where(V_ACTIVE_COMPETITION.c.competition_id == comp_id)
+    )
+    if eval_ends_at is not None and eval_ends_at.tzinfo is None:
+        eval_ends_at = eval_ends_at.replace(tzinfo=timezone.utc)
+    competition_finished = eval_ends_at is not None and datetime.now(timezone.utc) >= eval_ends_at
+
     rows = await _fetch_swe_rows(db, comp_id=comp_id, hotkey=hotkey, task_name=task_name)
     if not rows:
         raise HTTPException(
@@ -1755,7 +2110,7 @@ async def get_swe_miner_task_runs(
     )
 
     return SweMinerTaskRunsResponse(
-        task_name=task_name,
+        task_name=task_name if competition_finished else TEXT_HIDDEN_PLACEHOLDER,
         is_screener=bool(task_group["is_screener"]),
         pass_without_compression=task_group["baseline_pass_without_compression"],
         tokens_without_compression=(

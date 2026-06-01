@@ -208,6 +208,10 @@ class Settings(BaseSettings):
         default=8,
         alias="SWEBENCH_DISPATCH_BATCH_SIZE",
     )
+    swebench_dispatch_strict_fifo: bool = Field(
+        default=False,
+        alias="SWEBENCH_DISPATCH_STRICT_FIFO",
+    )
     swebench_dispatched_ttl_seconds: int = Field(
         default=2400,
         alias="SWEBENCH_DISPATCHED_TTL_SECONDS",

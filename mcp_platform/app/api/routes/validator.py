@@ -41,7 +41,7 @@ from app.api.routes.utils import (
 )
 from app.core.config import settings
 from app.core.logging import get_logger
-from app.db.interfaces import fetch_top_screener_ss58_for_competition
+from app.db.interfaces import fetch_swebench_eligible_ss58_for_competition
 from app.db.interfaces.burn_weight_queries import get_active_top_miner_rows
 from app.db.interfaces.competition_queries import (
     get_active_competition_upload_starts_at,
@@ -112,30 +112,14 @@ async def _load_top_screener_uids_for_competition(
     request_id: str | None,
     competition_id: int,
     source: str,
-    top_screener_scripts: float,
+    min_resolved: int,
     hotkey_to_uid: dict[str, int],
 ) -> list[int]:
-    if top_screener_scripts <= 0:
-        return []
-
-    top_hotkeys, total_eligible, top_limit = await fetch_top_screener_ss58_for_competition(
+    top_hotkeys = await fetch_swebench_eligible_ss58_for_competition(
         db,
         competition_id=competition_id,
-        top_screener_scripts=top_screener_scripts,
+        min_resolved=min_resolved,
     )
-    if top_limit <= 0:
-        logger.info(
-            "get_best_miners_screener_selected_for_competition",
-            extra={
-                "request_id": request_id,
-                "competition_id": competition_id,
-                "source": source,
-                "total_eligible": total_eligible,
-                "top_limit": top_limit,
-                "selected_count": 0,
-            },
-        )
-        return []
 
     selected_uids: list[int] = []
     for ss58 in top_hotkeys:
@@ -149,8 +133,8 @@ async def _load_top_screener_uids_for_competition(
             "request_id": request_id,
             "competition_id": competition_id,
             "source": source,
-            "total_eligible": total_eligible,
-            "top_limit": top_limit,
+            "eligible_count": len(top_hotkeys),
+            "min_resolved": min_resolved,
             "selected_count": len(selected_uids),
             "selected_uids": selected_uids,
         },
@@ -199,7 +183,10 @@ async def _collect_top_screener_uids(
     active_competition_id: int,
     hotkey_to_uid: dict[str, int],
 ) -> tuple[list[int], list[int], list[int]]:
-    top_screener_scripts = float(getattr(settings, "top_screener_scripts", 0.2))
+    min_resolved = max(
+        1,
+        int(getattr(settings, "screener_min_resolved", 4)),
+    )
     previous_competition_grace_hours = max(
         0.0,
         float(
@@ -215,7 +202,7 @@ async def _collect_top_screener_uids(
         extra={
             "request_id": request_id,
             "active_competition_id": active_competition_id,
-            "top_screener_scripts": top_screener_scripts,
+            "min_resolved": min_resolved,
             "previous_competition_grace_hours": previous_competition_grace_hours,
         },
     )
@@ -225,7 +212,7 @@ async def _collect_top_screener_uids(
         request_id=request_id,
         competition_id=active_competition_id,
         source="current_competition",
-        top_screener_scripts=top_screener_scripts,
+        min_resolved=min_resolved,
         hotkey_to_uid=hotkey_to_uid,
     )
     previous_top_screener_miners: list[int] = []
@@ -274,7 +261,7 @@ async def _collect_top_screener_uids(
                     request_id=request_id,
                     competition_id=previous_competition_id,
                     source="previous_competition",
-                    top_screener_scripts=top_screener_scripts,
+                    min_resolved=min_resolved,
                     hotkey_to_uid=hotkey_to_uid,
                 )
             )
@@ -693,7 +680,7 @@ async def get_swebench_validation(
         now = datetime.now(timezone.utc)
         claim_expires_at = now + timedelta(seconds=claim_ttl_seconds)
 
-        query_mine = (
+        query_unclaimed = (
             select(SweBenchRunValidation, SweBenchRun, SweBenchTask)
             .join(SweBenchRun, SweBenchRun.id == SweBenchRunValidation.run_fk)
             .join(SweBenchTask, SweBenchTask.id == SweBenchRun.task_fk)
@@ -701,48 +688,36 @@ async def get_swebench_validation(
             .where(SweBenchRunValidation.resolved.is_(None))
         )
         if completed_condition is not None:
-            query_mine = query_mine.where(completed_condition)
+            query_unclaimed = query_unclaimed.where(completed_condition)
         if validator_fk_col is not None:
-            query_mine = query_mine.where(validator_fk_col == validator.id)
-        # Keep returning already assigned work first.
-        # If we filtered by claim expiration here, a single validator could
-        # repeatedly fetch new tasks and end up with several open claims.
-        if claimed_at_col is not None:
-            query_mine = query_mine.order_by(claimed_at_col.asc(), SweBenchRunValidation.id.asc())
-        else:
-            query_mine = query_mine.order_by(SweBenchRunValidation.id.asc())
-        query_mine = query_mine.with_for_update(skip_locked=True).limit(1)
-        candidate_row = (await db.execute(query_mine)).first()
-
-        if candidate_row is None:
-            query_unclaimed = (
-                select(SweBenchRunValidation, SweBenchRun, SweBenchTask)
-                .join(SweBenchRun, SweBenchRun.id == SweBenchRunValidation.run_fk)
-                .join(SweBenchTask, SweBenchTask.id == SweBenchRun.task_fk)
-                .where(SweBenchRunValidation.scored_at.is_(None))
-                .where(SweBenchRunValidation.resolved.is_(None))
-            )
-            if completed_condition is not None:
-                query_unclaimed = query_unclaimed.where(completed_condition)
-            if validator_fk_col is not None:
-                if claim_expires_col is not None:
-                    query_unclaimed = query_unclaimed.where(
-                        or_(
-                            validator_fk_col.is_(None),
-                            and_(
-                                claim_expires_col.is_not(None),
-                                claim_expires_col < now,
+            reclaim_conditions = [validator_fk_col.is_(None)]
+            if claim_expires_col is not None:
+                reclaim_conditions.append(
+                    and_(
+                        claim_expires_col.is_not(None),
+                        claim_expires_col < now,
+                    )
+                )
+                # Backward compatibility: older rows may have validator_fk set
+                # without claim_expires_at (and sometimes without claimed_at),
+                # which makes them permanently unclaimable.
+                if claimed_at_col is not None:
+                    reclaim_conditions.append(
+                        and_(
+                            claim_expires_col.is_(None),
+                            or_(
+                                claimed_at_col.is_(None),
+                                claimed_at_col < (now - timedelta(seconds=claim_ttl_seconds)),
                             ),
                         )
                     )
-                else:
-                    query_unclaimed = query_unclaimed.where(validator_fk_col.is_(None))
-            query_unclaimed = (
-                query_unclaimed.order_by(SweBenchRunValidation.id.asc())
-                .with_for_update(skip_locked=True)
-                .limit(1)
-            )
-            candidate_row = (await db.execute(query_unclaimed)).first()
+            query_unclaimed = query_unclaimed.where(or_(*reclaim_conditions))
+        query_unclaimed = (
+            query_unclaimed.order_by(SweBenchRunValidation.id.asc())
+            .with_for_update(skip_locked=True)
+            .limit(1)
+        )
+        candidate_row = (await db.execute(query_unclaimed)).first()
 
         if candidate_row is None:
             await db.rollback()
