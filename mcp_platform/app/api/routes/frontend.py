@@ -349,11 +349,6 @@ async def _get_is_partial_winner(db: AsyncSession, comp_id: int) -> bool:
     """
     result = await db.scalar(
         select(CompressionCompetitionConfig.is_partial_winner)
-        .join(
-            CompetitionConfig,
-            CompetitionConfig.id == CompressionCompetitionConfig.competition_config_fk,
-        )
-        .where(CompetitionConfig.competition_fk == comp_id)
     )
     return bool(result)
 
@@ -2054,9 +2049,8 @@ async def get_swe_miner_task_results(
                 )
             }
         )
-        for group in task_groups.values()
+        for group in sorted(task_groups.values(), key=lambda group: int(group["task_id"]))
     ]
-    tasks.sort(key=lambda item: item.task_name)
 
     return SweMinerTaskResultsResponse(tasks=tasks, total=len(tasks))
 
