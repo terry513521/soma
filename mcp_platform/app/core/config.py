@@ -192,6 +192,10 @@ class Settings(BaseSettings):
         default=None,
         alias="COMPACT_BENCH_SERVICE_URL",
     )
+    compact_bench_service_urls: list[str] = Field(
+        default_factory=list,
+        alias="COMPACT_BENCH_SERVICE_URLS",
+    )
     swebench_benchmark_name: str = Field(
         default="SWE-bench/SWE-bench_Verified",
         alias="SWEBENCH_BENCHMARK_NAME",
@@ -316,6 +320,22 @@ class Settings(BaseSettings):
                 return []
             return [item.strip() for item in raw.split(",") if item.strip()]
         raise ValueError("TRUSTED_PROXY_CIDRS must be a list or comma-separated string")
+
+    @field_validator("compact_bench_service_urls", mode="before")
+    @classmethod
+    def _parse_compact_bench_service_urls(cls, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return []
+            return [item.strip() for item in raw.split(",") if item.strip()]
+        raise ValueError(
+            "COMPACT_BENCH_SERVICE_URLS must be a list or comma-separated string"
+        )
 
     @field_validator("top_screener_scripts", mode="before")
     @classmethod

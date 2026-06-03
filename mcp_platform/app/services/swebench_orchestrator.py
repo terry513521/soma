@@ -1094,13 +1094,17 @@ def _get_s3_storage(app) -> S3BlobStorage:
 def _get_compact_bench_manager(app) -> RemoteCompactBenchManager:
     manager = getattr(app.state, "swebench_compact_bench_manager", None)
     if manager is None:
-        service_url = settings.compact_bench_service_url or settings.sandbox_service_url
-        if not service_url:
-            raise RuntimeError(
-                "COMPACT_BENCH_SERVICE_URL or SANDBOX_SERVICE_URL must be set in configuration"
-            )
+        # Buduj listę URLi — nowe pole ma priorytet, fallback na stare
+        urls = [u.strip() for u in settings.compact_bench_service_urls if u.strip()]
+        if not urls:
+            legacy = settings.compact_bench_service_url or settings.sandbox_service_url
+            if not legacy:
+                raise RuntimeError(
+                    "COMPACT_BENCH_SERVICE_URLS or COMPACT_BENCH_SERVICE_URL or SANDBOX_SERVICE_URL must be set"
+                )
+            urls = [legacy]
         manager = RemoteCompactBenchManager(
-            sandbox_service_url=service_url,
+            sandbox_service_urls=urls,
             execution_timeout_seconds=settings.sandbox_timeout_per_task_seconds,
             submission_timeout_seconds=settings.sandbox_submission_timeout_seconds,
             default_model=settings.swebench_default_model,
