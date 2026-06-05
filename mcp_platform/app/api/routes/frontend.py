@@ -2058,13 +2058,16 @@ async def get_swe_miner_task_results(
     db: AsyncSession = Depends(get_db_session),
 ) -> SweMinerTaskResultsResponse:
     await _ensure_competition_exists(db, comp_id)
-    eval_ends_at = await db.scalar(
-        select(V_ACTIVE_COMPETITION.c.eval_ends_at)
-        .where(V_ACTIVE_COMPETITION.c.competition_id == comp_id)
+    upload_ends_at = await db.scalar(
+        select(CompetitionTimeframe.upload_ends_at)
+        .join(CompetitionConfig, CompetitionConfig.id == CompetitionTimeframe.competition_config_fk)
+        .where(CompetitionConfig.competition_fk == comp_id)
+        .order_by(CompetitionTimeframe.created_at.desc())
+        .limit(1)
     )
-    if eval_ends_at is not None and eval_ends_at.tzinfo is None:
-        eval_ends_at = eval_ends_at.replace(tzinfo=timezone.utc)
-    competition_finished = eval_ends_at is not None and datetime.now(timezone.utc) >= eval_ends_at
+    if upload_ends_at is not None and upload_ends_at.tzinfo is None:
+        upload_ends_at = upload_ends_at.replace(tzinfo=timezone.utc)
+    eval_started = upload_ends_at is not None and datetime.now(timezone.utc) >= upload_ends_at
 
     rows = await _fetch_swe_rows(db, comp_id=comp_id, hotkey=hotkey)
     if not rows:
@@ -2079,7 +2082,7 @@ async def get_swe_miner_task_results(
             update={
                 "task_name": (
                     group["task_name"]
-                    if competition_finished
+                    if eval_started
                     else TEXT_HIDDEN_PLACEHOLDER
                 )
             }
@@ -2102,13 +2105,16 @@ async def get_swe_miner_task_result(
     db: AsyncSession = Depends(get_db_session),
 ) -> SweMinerTaskDetailResponse:
     await _ensure_competition_exists(db, comp_id)
-    eval_ends_at = await db.scalar(
-        select(V_ACTIVE_COMPETITION.c.eval_ends_at)
-        .where(V_ACTIVE_COMPETITION.c.competition_id == comp_id)
+    upload_ends_at = await db.scalar(
+        select(CompetitionTimeframe.upload_ends_at)
+        .join(CompetitionConfig, CompetitionConfig.id == CompetitionTimeframe.competition_config_fk)
+        .where(CompetitionConfig.competition_fk == comp_id)
+        .order_by(CompetitionTimeframe.created_at.desc())
+        .limit(1)
     )
-    if eval_ends_at is not None and eval_ends_at.tzinfo is None:
-        eval_ends_at = eval_ends_at.replace(tzinfo=timezone.utc)
-    competition_finished = eval_ends_at is not None and datetime.now(timezone.utc) >= eval_ends_at
+    if upload_ends_at is not None and upload_ends_at.tzinfo is None:
+        upload_ends_at = upload_ends_at.replace(tzinfo=timezone.utc)
+    eval_started = upload_ends_at is not None and datetime.now(timezone.utc) >= upload_ends_at
 
     task_id = await _resolve_swe_task_id_or_name(db, comp_id=comp_id, task_name=task_name)
     rows = await _fetch_swe_rows(db, comp_id=comp_id, hotkey=hotkey, task_id=task_id)
@@ -2131,7 +2137,7 @@ async def get_swe_miner_task_result(
             update={
                 "task_name": (
                     task_group["task_name"]
-                    if competition_finished
+                    if eval_started
                     else TEXT_HIDDEN_PLACEHOLDER
                 )
             }
@@ -2151,13 +2157,16 @@ async def get_swe_miner_task_runs(
     db: AsyncSession = Depends(get_db_session),
 ) -> SweMinerTaskRunsResponse:
     await _ensure_competition_exists(db, comp_id)
-    eval_ends_at = await db.scalar(
-        select(V_ACTIVE_COMPETITION.c.eval_ends_at)
-        .where(V_ACTIVE_COMPETITION.c.competition_id == comp_id)
+    upload_ends_at = await db.scalar(
+        select(CompetitionTimeframe.upload_ends_at)
+        .join(CompetitionConfig, CompetitionConfig.id == CompetitionTimeframe.competition_config_fk)
+        .where(CompetitionConfig.competition_fk == comp_id)
+        .order_by(CompetitionTimeframe.created_at.desc())
+        .limit(1)
     )
-    if eval_ends_at is not None and eval_ends_at.tzinfo is None:
-        eval_ends_at = eval_ends_at.replace(tzinfo=timezone.utc)
-    competition_finished = eval_ends_at is not None and datetime.now(timezone.utc) >= eval_ends_at
+    if upload_ends_at is not None and upload_ends_at.tzinfo is None:
+        upload_ends_at = upload_ends_at.replace(tzinfo=timezone.utc)
+    eval_started = upload_ends_at is not None and datetime.now(timezone.utc) >= upload_ends_at
 
     task_id = await _resolve_swe_task_id_or_name(db, comp_id=comp_id, task_name=task_name)
     rows = await _fetch_swe_rows(db, comp_id=comp_id, hotkey=hotkey, task_id=task_id)
@@ -2184,7 +2193,7 @@ async def get_swe_miner_task_runs(
         task_id=int(task_group["task_id"]),
         task_name=(
             str(task_group["task_name"])
-            if competition_finished
+            if eval_started
             else TEXT_HIDDEN_PLACEHOLDER
         ),
         is_screener=bool(task_group["is_screener"]),
