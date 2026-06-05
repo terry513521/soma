@@ -79,6 +79,12 @@ from app.api.routes.scoring import (
     build_swe_task_groups,
     build_swe_task_result_item,
 )
+from app.services.swe_difficulty_calculator import (
+    build_baseline_task_data,
+    build_miner_category_scores,
+    derive_task_difficulties,
+)
+from app.db.interfaces import fetch_swebench_eligible_ss58_for_competition
 from app.api.routes.utils import (
     _get_current_burn_state,
     _require_private_network,
@@ -374,7 +380,7 @@ async def _fetch_swe_rows(
     *,
     comp_id: int,
     hotkey: str | None = None,
-    task_name: str | None = None,
+    task_id: int | None = None,
 ) -> list[sa.Row]:
     baseline_runs = SWE_BENCH_RUNS.alias("baseline_runs")
     baseline_validations = SWE_BENCH_RUN_VALIDATIONS.alias("baseline_validations")
@@ -432,8 +438,8 @@ async def _fetch_swe_rows(
 
     if hotkey is not None:
         query = query.where(Miner.ss58 == hotkey)
-    if task_name is not None:
-        query = query.where(SWE_BENCH_TASKS.c.instance_id == task_name)
+    if task_id is not None:
+        query = query.where(SWE_BENCH_TASKS.c.id == task_id)
 
     try:
         result = await db.execute(query)
@@ -443,7 +449,7 @@ async def _fetch_swe_rows(
             extra={
                 "competition_id": comp_id,
                 "hotkey": hotkey,
-                "task_name": task_name,
+                "task_id": task_id,
             },
             exc_info=exc,
         )
@@ -453,6 +459,46 @@ async def _fetch_swe_rows(
         ) from exc
 
     return list(result)
+
+
+async def _resolve_swe_task_id(
+    db: AsyncSession,
+    *,
+    comp_id: int,
+    task_name: str,
+) -> int:
+    task_id = await db.scalar(
+        select(SWE_BENCH_TASKS.c.id)
+        .where(SWE_BENCH_TASKS.c.competition_fk == comp_id)
+        .where(SWE_BENCH_TASKS.c.instance_id == task_name)
+        .limit(1)
+    )
+    if task_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Task not found",
+        )
+    return int(task_id)
+
+
+async def _resolve_swe_task_id_or_name(
+    db: AsyncSession,
+    *,
+    comp_id: int,
+    task_name: str,
+) -> int:
+    if task_name.isdigit():
+        task_id = int(task_name)
+        exists = await db.scalar(
+            select(SWE_BENCH_TASKS.c.id)
+            .where(SWE_BENCH_TASKS.c.competition_fk == comp_id)
+            .where(SWE_BENCH_TASKS.c.id == task_id)
+            .limit(1)
+        )
+        if exists is not None:
+            return task_id
+
+    return await _resolve_swe_task_id(db, comp_id=comp_id, task_name=task_name)
 
 
 def _required_screener_task_passes(total_screener_tasks: int) -> int:
@@ -1901,14 +1947,25 @@ async def list_swe_miners_by_competition(
     for row in rows:
         miner_rows.setdefault(str(row.hotkey), []).append(row)
 
+    min_resolved = settings.screener_min_resolved
+    eligible_hotkeys = set(
+        await fetch_swebench_eligible_ss58_for_competition(
+            db, competition_id=comp_id, min_resolved=min_resolved
+        )
+    )
+
+    task_difficulties = derive_task_difficulties(build_baseline_task_data(rows))
+    miner_category_scores = build_miner_category_scores(rows, task_difficulties)
+
     grouped: dict[str, dict[str, object]] = {}
     for hotkey, task_rows in miner_rows.items():
         task_groups = build_swe_task_groups(task_rows)
-        total_score, screener_score = build_swe_miner_scores(task_groups)
+        total_score, _ = build_swe_miner_scores(task_groups)
         grouped[hotkey] = {
             "hotkey": hotkey,
             "total_score": total_score,
-            "screener_score": screener_score,
+            "screener_passed": hotkey in eligible_hotkeys,
+            "category_scores": miner_category_scores.get(hotkey),
         }
 
     sorted_miners = sorted(
@@ -1916,7 +1973,7 @@ async def list_swe_miners_by_competition(
         key=lambda item: (
             item["total_score"] is None,
             -(item["total_score"] or 0.0),
-            -(item["screener_score"] or 0.0),
+            not item["screener_passed"],
             item["hotkey"],
         ),
     )
@@ -1931,7 +1988,8 @@ async def list_swe_miners_by_competition(
             SweMinerLeaderboardItem(
                 hotkey=str(item["hotkey"]),
                 total_score=item["total_score"],
-                screener_score=item["screener_score"],
+                screener_passed=bool(item["screener_passed"]),
+                category_scores=item["category_scores"] or None,
             )
             for item in selected_miners
         ],
@@ -1964,13 +2022,25 @@ async def get_swe_miner_by_competition(
 
     task_groups = build_swe_task_groups(rows)
     task_items = [build_swe_task_result_item(group) for group in task_groups.values()]
-    total_score, screener_score = build_swe_miner_scores(task_groups)
+    total_score, _ = build_swe_miner_scores(task_groups)
+
+    task_difficulties = derive_task_difficulties(build_baseline_task_data(rows))
+    miner_category_scores = build_miner_category_scores(rows, task_difficulties)
+    category_scores = miner_category_scores.get(hotkey) or None
+
+    min_resolved = settings.screener_min_resolved
+    eligible_hotkeys = set(
+        await fetch_swebench_eligible_ss58_for_competition(
+            db, competition_id=comp_id, min_resolved=min_resolved
+        )
+    )
 
     return SweMinerSummaryResponse(
         miner=SweMinerSummary(
             hotkey=hotkey,
             total_score=total_score,
-            screener_score=screener_score,
+            screener_passed=hotkey in eligible_hotkeys,
+            category_scores=category_scores,
             task_count=len(task_items),
             screener_task_count=sum(1 for item in task_items if item.is_screener),
         )
@@ -2014,9 +2084,8 @@ async def get_swe_miner_task_results(
                 )
             }
         )
-        for group in task_groups.values()
+        for group in sorted(task_groups.values(), key=lambda group: int(group["task_id"]))
     ]
-    tasks.sort(key=lambda item: item.task_name)
 
     return SweMinerTaskResultsResponse(tasks=tasks, total=len(tasks))
 
@@ -2041,7 +2110,8 @@ async def get_swe_miner_task_result(
         eval_ends_at = eval_ends_at.replace(tzinfo=timezone.utc)
     competition_finished = eval_ends_at is not None and datetime.now(timezone.utc) >= eval_ends_at
 
-    rows = await _fetch_swe_rows(db, comp_id=comp_id, hotkey=hotkey, task_name=task_name)
+    task_id = await _resolve_swe_task_id_or_name(db, comp_id=comp_id, task_name=task_name)
+    rows = await _fetch_swe_rows(db, comp_id=comp_id, hotkey=hotkey, task_id=task_id)
     if not rows:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -2049,7 +2119,7 @@ async def get_swe_miner_task_result(
         )
 
     task_groups = build_swe_task_groups(rows)
-    task_group = task_groups.get(task_name)
+    task_group = task_groups.get(task_id)
     if task_group is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -2089,7 +2159,8 @@ async def get_swe_miner_task_runs(
         eval_ends_at = eval_ends_at.replace(tzinfo=timezone.utc)
     competition_finished = eval_ends_at is not None and datetime.now(timezone.utc) >= eval_ends_at
 
-    rows = await _fetch_swe_rows(db, comp_id=comp_id, hotkey=hotkey, task_name=task_name)
+    task_id = await _resolve_swe_task_id_or_name(db, comp_id=comp_id, task_name=task_name)
+    rows = await _fetch_swe_rows(db, comp_id=comp_id, hotkey=hotkey, task_id=task_id)
     if not rows:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -2097,7 +2168,7 @@ async def get_swe_miner_task_runs(
         )
 
     task_groups = build_swe_task_groups(rows)
-    task_group = task_groups.get(task_name)
+    task_group = task_groups.get(task_id)
     if task_group is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -2110,7 +2181,12 @@ async def get_swe_miner_task_runs(
     )
 
     return SweMinerTaskRunsResponse(
-        task_name=task_name if competition_finished else TEXT_HIDDEN_PLACEHOLDER,
+        task_id=int(task_group["task_id"]),
+        task_name=(
+            str(task_group["task_name"])
+            if competition_finished
+            else TEXT_HIDDEN_PLACEHOLDER
+        ),
         is_screener=bool(task_group["is_screener"]),
         pass_without_compression=task_group["baseline_pass_without_compression"],
         tokens_without_compression=(
@@ -2124,7 +2200,11 @@ async def get_swe_miner_task_runs(
                 attempt_no=int(run["attempt_no"]),
                 pass_with_compression=run["pass_with_compression"],
                 tokens_with_compression=run["tokens_with_compression"],
-                platform_score=float(run["platform_score"]),
+                platform_score=(
+                    float(run["platform_score"])
+                    if run["platform_score"] is not None
+                    else None
+                ),
                 time_taken_seconds=run["time_taken_seconds"],
                 agent_steps=run["agent_steps"],
             )
