@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+
 from typing import Any
 
 import httpx
@@ -27,15 +29,30 @@ class RemoteCompactBenchManager:
     def __init__(
         self,
         *,
-        sandbox_service_url: str,
+        sandbox_service_urls: list[str] | None = None,
         execution_timeout_seconds: float,
         submission_timeout_seconds: float,
         default_model: str | None = None,
+        sandbox_service_url: str | None = None,
     ):
-        self._sandbox_service_url = sandbox_service_url.rstrip("/")
+        urls = [str(u).strip().rstrip("/") for u in (sandbox_service_urls or []) if str(u).strip()]
+        # Deprecated single-URL fallback: only used when no list was provided.
+        if not urls and sandbox_service_url:
+            urls = [sandbox_service_url.strip().rstrip("/")]
+        self._sandbox_service_urls: list[str] = urls
+        self._rr_index: int = 0
+        self._rr_lock: threading.Lock = threading.Lock()
         self._execution_timeout_seconds = execution_timeout_seconds
         self._submission_timeout_seconds = submission_timeout_seconds
         self._default_model = (default_model or "").strip() or None
+
+    def _pick_sandbox_url(self) -> str:
+        with self._rr_lock:
+            if not self._sandbox_service_urls:
+                raise RuntimeError("No sandbox service URLs configured")
+            url = self._sandbox_service_urls[self._rr_index % len(self._sandbox_service_urls)]
+            self._rr_index = (self._rr_index + 1) % len(self._sandbox_service_urls)
+            return url
 
     async def execute_task(
         self,
@@ -168,8 +185,9 @@ class RemoteCompactBenchManager:
         payload: CompactBenchRunTaskRequest,
         timeout: float,
     ) -> CompactBenchRunTaskResponse:
+        sandbox_url = self._pick_sandbox_url()
         response = await client.post(
-            f"{self._sandbox_service_url}/run_compact_bench_task",
+            f"{sandbox_url}/run_compact_bench_task",
             json=payload.model_dump(mode="json"),
             timeout=timeout,
         )
