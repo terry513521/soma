@@ -194,6 +194,9 @@ def build_swe_task_groups(rows: list[Any]) -> dict[int, dict[str, object]]:
 
 def build_swe_task_result_item(group: dict[str, object]) -> SweMinerTaskResultItem:
     runs = list(group["runs"])
+    passed_runs = sum(1 for run in runs if run["pass_with_compression"] is True)
+    total_runs = len(runs)
+    task_passed = passed_runs >= ((total_runs + 1) // 2) if total_runs else None
     run_scores = [
         float(run["platform_score"])
         for run in runs
@@ -209,6 +212,7 @@ def build_swe_task_result_item(group: dict[str, object]) -> SweMinerTaskResultIt
         task_id=int(group["task_id"]),
         task_name=str(group["task_name"]),
         is_screener=bool(group["is_screener"]),
+        passed=task_passed if bool(group["is_screener"]) else None,
         pass_without_compression=group["baseline_pass_without_compression"],
         pass_with_compression=(
             runs[0]["pass_with_compression"] if len(runs) == 1 else None
@@ -224,8 +228,6 @@ def build_swe_task_result_item(group: dict[str, object]) -> SweMinerTaskResultIt
         platform_score=(sum(run_scores) / len(run_scores) if run_scores else None),
         run_count=len(runs),
     )
-
-
 def build_swe_miner_scores(
     task_groups: dict[int, dict[str, object]],
 ) -> tuple[float | None, float | None]:

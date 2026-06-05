@@ -355,6 +355,11 @@ async def _get_is_partial_winner(db: AsyncSession, comp_id: int) -> bool:
     """
     result = await db.scalar(
         select(CompressionCompetitionConfig.is_partial_winner)
+        .join(
+            CompetitionConfig,
+            CompetitionConfig.id == CompressionCompetitionConfig.competition_config_fk,
+        )
+        .where(CompetitionConfig.competition_fk == comp_id)
     )
     return bool(result)
 
@@ -476,7 +481,6 @@ async def _resolve_swe_task_id(
     return int(task_id)
 
 
-<<<<<<< HEAD
 async def _resolve_swe_task_id_or_name(
     db: AsyncSession,
     *,
@@ -497,8 +501,6 @@ async def _resolve_swe_task_id_or_name(
     return await _resolve_swe_task_id(db, comp_id=comp_id, task_name=task_name)
 
 
-=======
->>>>>>> ab73812 (change task name mapping to id based mapping)
 def _required_screener_task_passes(total_screener_tasks: int) -> int:
     if total_screener_tasks <= 0:
         return 0
@@ -2084,10 +2086,6 @@ async def get_swe_miner_task_results(
         )
         for group in sorted(task_groups.values(), key=lambda group: int(group["task_id"]))
     ]
-<<<<<<< HEAD
-=======
-    tasks.sort(key=lambda item: item.task_id)
->>>>>>> ab73812 (change task name mapping to id based mapping)
 
     return SweMinerTaskResultsResponse(tasks=tasks, total=len(tasks))
 
@@ -2112,11 +2110,7 @@ async def get_swe_miner_task_result(
         eval_ends_at = eval_ends_at.replace(tzinfo=timezone.utc)
     competition_finished = eval_ends_at is not None and datetime.now(timezone.utc) >= eval_ends_at
 
-<<<<<<< HEAD
     task_id = await _resolve_swe_task_id_or_name(db, comp_id=comp_id, task_name=task_name)
-=======
-    task_id = await _resolve_swe_task_id(db, comp_id=comp_id, task_name=task_name)
->>>>>>> ab73812 (change task name mapping to id based mapping)
     rows = await _fetch_swe_rows(db, comp_id=comp_id, hotkey=hotkey, task_id=task_id)
     if not rows:
         raise HTTPException(
@@ -2165,11 +2159,7 @@ async def get_swe_miner_task_runs(
         eval_ends_at = eval_ends_at.replace(tzinfo=timezone.utc)
     competition_finished = eval_ends_at is not None and datetime.now(timezone.utc) >= eval_ends_at
 
-<<<<<<< HEAD
     task_id = await _resolve_swe_task_id_or_name(db, comp_id=comp_id, task_name=task_name)
-=======
-    task_id = await _resolve_swe_task_id(db, comp_id=comp_id, task_name=task_name)
->>>>>>> ab73812 (change task name mapping to id based mapping)
     rows = await _fetch_swe_rows(db, comp_id=comp_id, hotkey=hotkey, task_id=task_id)
     if not rows:
         raise HTTPException(
@@ -2210,7 +2200,11 @@ async def get_swe_miner_task_runs(
                 attempt_no=int(run["attempt_no"]),
                 pass_with_compression=run["pass_with_compression"],
                 tokens_with_compression=run["tokens_with_compression"],
-                platform_score=float(run["platform_score"]),
+                platform_score=(
+                    float(run["platform_score"])
+                    if run["platform_score"] is not None
+                    else None
+                ),
                 time_taken_seconds=run["time_taken_seconds"],
                 agent_steps=run["agent_steps"],
             )
