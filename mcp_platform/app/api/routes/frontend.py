@@ -526,6 +526,7 @@ async def _build_swe_status_overrides(
         select(
             Miner.id.label("miner_fk"),
             Miner.ss58.label("ss58"),
+            Miner.miner_banned_status.label("is_banned"),
         )
         .where(Miner.ss58.in_(hotkeys))
         .subquery("page_miners")
@@ -559,6 +560,7 @@ async def _build_swe_status_overrides(
             select(
                 page_miners_sq.c.ss58,
                 page_miners_sq.c.miner_fk,
+                page_miners_sq.c.is_banned,
                 latest_scripts_sq.c.script_fk,
                 active_key_exists.label("has_active_key"),
             )
@@ -577,9 +579,13 @@ async def _build_swe_status_overrides(
     script_refs: dict[str, tuple[int, int]] = {}
     for row in miner_script_rows:
         ss58 = str(row.ss58)
+        is_banned = bool(row.is_banned)
         miner_fk = int(row.miner_fk)
         has_active_key = bool(row.has_active_key)
         script_fk = int(row.script_fk) if row.script_fk is not None else None
+        if is_banned:
+            status_by_hotkey[ss58] = "failed review"
+            continue
         if not has_active_key:
             status_by_hotkey[ss58] = "no api key"
             continue
