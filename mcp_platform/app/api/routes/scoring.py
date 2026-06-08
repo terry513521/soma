@@ -207,7 +207,20 @@ def build_swe_task_result_item(group: dict[str, object]) -> SweMinerTaskResultIt
         for run in runs
         if run["tokens_with_compression"] is not None
     ]
-
+    raw_platform_score = (sum(run_scores) / len(run_scores) if run_scores else None)
+    baseline_tokens = (
+        int(group["baseline_tokens_without_compression"])
+        if group["baseline_tokens_without_compression"] is not None
+        else None
+    )
+    avg_compressed = (
+        sum(compressed_tokens) / len(compressed_tokens) if compressed_tokens else None
+    )
+    adjusted_score = adjust_miner_score_with_token_savings(
+        raw_platform_score,
+        total_baseline_tokens=baseline_tokens,
+        total_compressed_tokens=int(avg_compressed) if avg_compressed else None,
+    )
     return SweMinerTaskResultItem(
         task_id=int(group["task_id"]),
         task_name=str(group["task_name"]),
@@ -225,7 +238,7 @@ def build_swe_task_result_item(group: dict[str, object]) -> SweMinerTaskResultIt
         tokens_with_compression=(
             sum(compressed_tokens) / len(compressed_tokens) if compressed_tokens else None
         ),
-        platform_score=(sum(run_scores) / len(run_scores) if run_scores else None),
+        platform_score=adjusted_score,
         run_count=len(runs),
     )
 def build_swe_miner_scores(
