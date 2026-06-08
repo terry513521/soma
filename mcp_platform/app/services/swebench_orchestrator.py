@@ -1094,7 +1094,7 @@ def _get_s3_storage(app) -> S3BlobStorage:
 def _get_compact_bench_manager(app) -> RemoteCompactBenchManager:
     manager = getattr(app.state, "swebench_compact_bench_manager", None)
     if manager is None:
-        # Buduj listę URLi — nowe pole ma priorytet, fallback na stare
+
         urls = [u.strip() for u in settings.compact_bench_service_urls if u.strip()]
         if not urls:
             legacy = settings.compact_bench_service_url or settings.sandbox_service_url
