@@ -277,6 +277,7 @@ def build_miner_category_scores(
         task_difficulty.task_name: task_difficulty.category
         for task_difficulty in task_difficulties
     }
+    required_tasks = set(category_by_task)
     rows_by_hotkey: dict[str, list[Any]] = defaultdict(list)
     for row in rows:
         hotkey = getattr(row, "hotkey", None)
@@ -289,6 +290,7 @@ def build_miner_category_scores(
     )
     for hotkey, hotkey_rows in rows_by_hotkey.items():
         task_groups = build_swe_task_groups(hotkey_rows)
+        task_scores_by_name: dict[str, float] = {}
         for task_name, task_group in task_groups.items():
             category = category_by_task.get(task_name)
             if category is None:
@@ -302,9 +304,16 @@ def build_miner_category_scores(
             if not run_scores:
                 continue
 
-            miner_category_scores[hotkey][category].append(
-                sum(run_scores) / len(run_scores)
-            )
+            task_scores_by_name[task_name] = sum(run_scores) / len(run_scores)
+
+        if required_tasks and set(task_scores_by_name) != required_tasks:
+            continue
+
+        for task_name, task_score in task_scores_by_name.items():
+            category = category_by_task.get(task_name)
+            if category is None:
+                continue
+            miner_category_scores[hotkey][category].append(task_score)
 
     return {
         hotkey: {

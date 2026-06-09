@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.routes.utils import _get_current_burn_state, _require_private_network
+from app.core.logging import get_logger
 from app.services.incentive_calculator import replace_competition_top_miner_candidates
 from app.services.top_miner_approval import set_top_miner_approval
 from soma_shared.db.models.competition import Competition
@@ -47,6 +48,8 @@ router = APIRouter(
     tags=["incentives"],
     dependencies=[Depends(_require_private_network)],
 )
+
+logger = get_logger(__name__)
 
 def _normalize_utc_datetime(value: datetime) -> datetime:
     if value.tzinfo is None:
@@ -153,6 +156,17 @@ async def generate_incentive_candidates(
         await db.commit()
     except Exception as exc:
         await db.rollback()
+        logger.exception(
+            "generate_incentive_candidates_failed",
+            extra={
+                "competition_id": competition_id,
+                "starts_at": starts_at.isoformat(),
+                "ends_at": ends_at.isoformat(),
+                "burn_active": burn_active,
+                "burn_ratio": burn_ratio,
+                "effective_burn_ratio": effective_burn_ratio,
+            },
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to generate incentive candidates",

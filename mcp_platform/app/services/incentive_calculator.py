@@ -250,7 +250,7 @@ async def load_competition_incentive_inputs(
         )
     ).all()
 
-    task_difficulties = derive_task_difficulties(_build_baseline_task_data(rows))
+    task_difficulties = derive_task_difficulties(build_baseline_task_data(rows))
     miner_category_scores = build_miner_category_scores(rows, task_difficulties)
     return DIFFICULTY_CATEGORIES, miner_category_scores
 
