@@ -153,12 +153,12 @@ async def fetch_swebench_eligible_ss58_for_competition(
                     GROUP BY r.miner_fk, r.task_fk
                 ),
                 miner_resolved_tasks AS (
-                    -- A task is "passed" when at least 2/3 of its scored runs resolved.
+                    -- A task is "passed" when at least 3/5 of its scored runs resolved.
                     SELECT
                         miner_fk,
                         COUNT(*) FILTER (
                             WHERE total_scored > 0
-                              AND resolved_count >= CEIL(2.0 * total_scored / 3.0)
+                              AND resolved_count >= CEIL(3.0 * total_scored / 5.0)
                         ) AS resolved_tasks
                     FROM task_run_stats
                     GROUP BY miner_fk
