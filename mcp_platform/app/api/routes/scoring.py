@@ -28,10 +28,10 @@ def _average_optional_int(values: list[int | None]) -> float | None:
 def _summarize_baseline_pass(baseline_runs: dict[int, dict[str, object]]) -> bool | None:
     if not baseline_runs:
         return None
-    resolved_values = {baseline["resolved"] for baseline in baseline_runs.values()}
-    if len(resolved_values) != 1:
-        return None
-    return next(iter(resolved_values))
+    resolved_values = [baseline["resolved"] for baseline in baseline_runs.values()]
+    true_count = sum(1 for v in resolved_values if v is True)
+    total = len(resolved_values)
+    return true_count >= ((total + 1) // 2)
 
 
 def trim_token_ratio(tokens_without_compression: int | None, tokens_with_compression: int | None) -> float:
@@ -207,15 +207,21 @@ def build_swe_task_result_item(group: dict[str, object]) -> SweMinerTaskResultIt
         for run in runs
         if run["tokens_with_compression"] is not None
     ]
+    passed_with_compression_values = [
+    run["pass_with_compression"] for run in runs
+    if run["pass_with_compression"] is not None
+    ]
+    pass_with_compression_result = (
+    sum(1 for v in passed_with_compression_values if v is True) >= ((len(passed_with_compression_values) + 1) // 2)
+    if passed_with_compression_values else None
+    )
     return SweMinerTaskResultItem(
         task_id=int(group["task_id"]),
         task_name=str(group["task_name"]),
         is_screener=bool(group["is_screener"]),
         passed=task_passed if bool(group["is_screener"]) else None,
         pass_without_compression=group["baseline_pass_without_compression"],
-        pass_with_compression=(
-            runs[0]["pass_with_compression"] if len(runs) == 1 else None
-        ),
+        pass_with_compression=pass_with_compression_result,
         tokens_without_compression=(
             int(group["baseline_tokens_without_compression"])
             if group["baseline_tokens_without_compression"] is not None
