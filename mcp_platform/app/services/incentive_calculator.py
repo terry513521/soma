@@ -23,7 +23,6 @@ from app.services.swe_difficulty_calculator import (
     CategoryValue,
     MinerCategoryScores,
     build_baseline_task_data,
-    build_miner_category_scores,
     derive_task_difficulties,
 )
 
@@ -101,11 +100,32 @@ def _subset_average_score(
     return sum(subset_scores) / len(subset_scores)
 
 
+def _miner_total_score_from_rows(rows: Sequence[object]) -> dict[str, float]:
+    from app.api.routes.scoring import build_swe_miner_scores, build_swe_task_groups
+
+    rows_by_hotkey: dict[str, list[object]] = {}
+    for row in rows:
+        hotkey = getattr(row, "hotkey", None)
+        if hotkey is None:
+            continue
+        rows_by_hotkey.setdefault(str(hotkey), []).append(row)
+
+    miner_total_scores: dict[str, float] = {}
+    for hotkey, hotkey_rows in rows_by_hotkey.items():
+        task_groups = build_swe_task_groups(hotkey_rows)
+        total_score, _ = build_swe_miner_scores(task_groups)
+        if total_score is not None:
+            miner_total_scores[hotkey] = float(total_score)
+
+    return miner_total_scores
+
+
 def calculate_incentive_weights(
     miner_category_scores: Mapping[str, Mapping[CategoryValue, float]],
     categories: Sequence[str],
     *,
     burn_ratio: float,
+    miner_total_scores: Mapping[str, float] | None = None,
 ) -> IncentiveCalculationResult:
     normalized_categories = _normalize_categories(categories)
     miners_share = max(0.0, 1.0 - float(burn_ratio))
@@ -120,10 +140,17 @@ def calculate_incentive_weights(
 
         for subset in layer_subsets:
             subset_scores: dict[str, float] = {}
-            for hotkey, scores in miner_category_scores.items():
-                subset_score = _subset_average_score(scores, subset)
-                if subset_score is not None:
-                    subset_scores[hotkey] = subset_score
+            if miner_total_scores is not None and len(subset) == len(normalized_categories):
+                subset_scores = {
+                    hotkey: float(miner_total_scores[hotkey])
+                    for hotkey in miner_category_scores
+                    if hotkey in miner_total_scores
+                }
+            else:
+                for hotkey, scores in miner_category_scores.items():
+                    subset_score = _subset_average_score(scores, subset)
+                    if subset_score is not None:
+                        subset_scores[hotkey] = subset_score
 
             if not subset_scores:
                 element_results.append(
@@ -195,7 +222,9 @@ async def load_competition_incentive_inputs(
     db: AsyncSession,
     *,
     competition_id: int,
-) -> tuple[tuple[CategoryValue, ...], MinerCategoryScores]:
+) -> tuple[tuple[CategoryValue, ...], MinerCategoryScores, dict[str, float]]:
+    from app.api.routes.scoring import build_swe_miner_category_scores_with_penalty
+
     baseline_runs = aliased(SweBenchRun, name="baseline_runs")
     baseline_validations = aliased(SweBenchRunValidation, name="baseline_validations")
     miner_runs = aliased(SweBenchRun, name="miner_runs")
@@ -204,7 +233,9 @@ async def load_competition_incentive_inputs(
     rows = (
         await db.execute(
             select(
+                SweBenchTask.id.label("task_id"),
                 SweBenchTask.instance_id.label("task_name"),
+                SweBenchTask.is_screener.label("is_screener"),
                 Miner.ss58.label("hotkey"),
                 baseline_runs.id.label("baseline_run_id"),
                 baseline_runs.tokens_used.label("baseline_tokens_used"),
@@ -251,8 +282,9 @@ async def load_competition_incentive_inputs(
     ).all()
 
     task_difficulties = derive_task_difficulties(build_baseline_task_data(rows))
-    miner_category_scores = build_miner_category_scores(rows, task_difficulties)
-    return DIFFICULTY_CATEGORIES, miner_category_scores
+    miner_category_scores = build_swe_miner_category_scores_with_penalty(rows, task_difficulties)
+    miner_total_scores = _miner_total_score_from_rows(rows)
+    return DIFFICULTY_CATEGORIES, miner_category_scores, miner_total_scores
 
 
 async def calculate_competition_incentive_weights(
@@ -261,7 +293,7 @@ async def calculate_competition_incentive_weights(
     competition_id: int,
     burn_ratio: float,
 ) -> IncentiveCalculationResult:
-    categories, miner_category_scores = await load_competition_incentive_inputs(
+    categories, miner_category_scores, miner_total_scores = await load_competition_incentive_inputs(
         db,
         competition_id=competition_id,
     )
@@ -269,6 +301,7 @@ async def calculate_competition_incentive_weights(
         miner_category_scores,
         categories,
         burn_ratio=burn_ratio,
+        miner_total_scores=miner_total_scores,
     )
 
 
