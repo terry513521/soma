@@ -470,6 +470,17 @@ def _derive_swe_task_categories(rows: list[sa.Row]) -> dict[str, str]:
     }
 
 
+def _clean_swe_category_scores(
+    category_scores: dict[str, float | None],
+) -> dict[str, float] | None:
+    cleaned_scores = {
+        category: float(score)
+        for category, score in category_scores.items()
+        if score is not None
+    }
+    return cleaned_scores or None
+
+
 async def _fetch_swe_task_categories(
     db: AsyncSession,
     *,
@@ -1984,7 +1995,9 @@ async def list_swe_miners_by_competition(
     for hotkey, task_rows in miner_rows.items():
         task_groups = build_swe_task_groups(task_rows)
         total_score, _ = build_swe_miner_scores(task_groups)
-        category_scores = build_swe_category_scores(task_groups, task_categories)
+        category_scores = _clean_swe_category_scores(
+            build_swe_category_scores(task_groups, task_categories)
+        )
         grouped[hotkey] = {
             "hotkey": hotkey,
             "total_score": total_score,
@@ -2013,7 +2026,7 @@ async def list_swe_miners_by_competition(
                 hotkey=str(item["hotkey"]),
                 total_score=item["total_score"],
                 screener_passed=bool(item["screener_passed"]),
-                category_scores=item["category_scores"] or None,
+                category_scores=item["category_scores"],
             )
             for item in selected_miners
         ],
@@ -2049,7 +2062,9 @@ async def get_swe_miner_by_competition(
     total_score, _ = build_swe_miner_scores(task_groups)
 
     task_categories = await _fetch_swe_task_categories(db, comp_id=comp_id)
-    category_scores = build_swe_category_scores(task_groups, task_categories)
+    category_scores = _clean_swe_category_scores(
+        build_swe_category_scores(task_groups, task_categories)
+    )
 
     min_resolved = settings.screener_min_resolved
     eligible_hotkeys = set(
