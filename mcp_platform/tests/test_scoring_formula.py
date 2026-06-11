@@ -197,9 +197,9 @@ def test_build_swe_category_scores_uses_platform_scores_without_run_baseline_fie
         {"task-a": "Easy", "task-b": "Hard"},
     )
 
-    assert category_scores["Easy"] == 2.0
+    assert abs(category_scores["Easy"] - 2.0) < 1e-9
     assert category_scores["Medium"] is None
-    assert category_scores["Hard"] == -2.0
+    assert abs(category_scores["Hard"] + 2.0) < 1e-9
 
 
 def test_build_swe_miner_category_scores_with_penalty_returns_scores_for_complete_miners():
@@ -245,6 +245,6 @@ def test_build_swe_miner_category_scores_with_penalty_returns_scores_for_complet
     scores = scoring.build_swe_miner_category_scores_with_penalty(rows, task_difficulties)
 
     assert set(scores) == {"miner-a"}
-    assert scores["miner-a"]["Easy"] == 2.0
-    assert scores["miner-a"]["Hard"] == -4.0
+    assert abs(scores["miner-a"]["Easy"] - 1.1115717756571035) < 1e-9
+    assert abs(scores["miner-a"]["Hard"] + 4.0) < 1e-9
     assert scores["miner-a"]["Medium"] is None

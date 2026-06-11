@@ -156,6 +156,10 @@ async def generate_incentive_candidates(
         await db.commit()
     except Exception as exc:
         await db.rollback()
+        error_type = type(exc).__name__
+        error_message = str(exc).strip() or "(no message)"
+        if len(error_message) > 500:
+            error_message = error_message[:497] + "..."
         logger.exception(
             "generate_incentive_candidates_failed",
             extra={
@@ -165,11 +169,13 @@ async def generate_incentive_candidates(
                 "burn_active": burn_active,
                 "burn_ratio": burn_ratio,
                 "effective_burn_ratio": effective_burn_ratio,
+                "error_type": error_type,
+                "error_message": error_message,
             },
         )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to generate incentive candidates",
+            detail=f"Failed to generate incentive candidates: {error_type}: {error_message}",
         ) from exc
 
     return GenerateIncentiveCandidatesResponse(

@@ -25,7 +25,6 @@ from app.services.swe_difficulty_calculator import (
     build_baseline_task_data,
     derive_task_difficulties,
 )
-from app.api.routes.scoring import build_swe_miner_category_scores_with_penalty
 
 
 @dataclass(frozen=True)
@@ -143,8 +142,9 @@ def calculate_incentive_weights(
             subset_scores: dict[str, float] = {}
             if miner_total_scores is not None and len(subset) == len(normalized_categories):
                 subset_scores = {
-                    hotkey: float(score)
-                    for hotkey, score in miner_total_scores.items()
+                    hotkey: float(miner_total_scores[hotkey])
+                    for hotkey in miner_category_scores
+                    if hotkey in miner_total_scores
                 }
             else:
                 for hotkey, scores in miner_category_scores.items():
@@ -223,6 +223,8 @@ async def load_competition_incentive_inputs(
     *,
     competition_id: int,
 ) -> tuple[tuple[CategoryValue, ...], MinerCategoryScores, dict[str, float]]:
+    from app.api.routes.scoring import build_swe_miner_category_scores_with_penalty
+
     baseline_runs = aliased(SweBenchRun, name="baseline_runs")
     baseline_validations = aliased(SweBenchRunValidation, name="baseline_validations")
     miner_runs = aliased(SweBenchRun, name="miner_runs")
@@ -231,7 +233,9 @@ async def load_competition_incentive_inputs(
     rows = (
         await db.execute(
             select(
+                SweBenchTask.id.label("task_id"),
                 SweBenchTask.instance_id.label("task_name"),
+                SweBenchTask.is_screener.label("is_screener"),
                 Miner.ss58.label("hotkey"),
                 baseline_runs.id.label("baseline_run_id"),
                 baseline_runs.tokens_used.label("baseline_tokens_used"),

@@ -339,7 +339,8 @@ def build_swe_miner_category_scores_with_penalty(
     for hotkey, hotkey_rows in rows_by_hotkey.items():
         task_groups = build_swe_task_groups(hotkey_rows)
         task_scores_by_name: dict[str, float] = {}
-        for task_name, task_group in task_groups.items():
+        for task_group in task_groups.values():
+            task_name = str(task_group["task_name"])
             category = category_by_task.get(task_name)
             if category is None:
                 continue
