@@ -86,6 +86,7 @@ from app.services.swe_difficulty_calculator import (
     build_miner_category_scores,
     derive_task_difficulties,
 )
+from app.services.dash_rows_cache import DashRowsFrozenCache
 from app.db.interfaces import fetch_swebench_eligible_ss58_for_competition
 from app.api.routes.utils import (
     _get_current_burn_state,
@@ -96,6 +97,7 @@ from app.api.routes.utils import (
 logger = get_logger(__name__)
 _cache = Cache(Cache.MEMORY)
 _rate_limit_cache = Cache(Cache.MEMORY, namespace="frontend_api_key_rate_limit")
+_dash_rows_cache = DashRowsFrozenCache()
 TEXT_HIDDEN_PLACEHOLDER = "Will be available after uploads finish"
 API_KEY_HEADER = "x-api-key"
 
@@ -378,6 +380,32 @@ async def _ensure_competition_exists(db: AsyncSession, comp_id: int) -> None:
 
 
 async def _fetch_swe_rows(
+    db: AsyncSession,
+    *,
+    comp_id: int,
+    hotkey: str | None = None,
+    task_id: int | None = None,
+) -> list[sa.Row]:
+    if hotkey is None:
+        return await _fetch_swe_rows_live(db, comp_id=comp_id, hotkey=hotkey, task_id=task_id)
+
+    if await _dash_rows_cache.is_hotkey_frozen(comp_id, hotkey):
+        cached_rows = await _dash_rows_cache.get_cached_rows(comp_id, hotkey)
+        if cached_rows is not None:
+            return _dash_rows_cache.filter_rows_for_task(cached_rows, task_id)
+
+        live_rows = await _fetch_swe_rows_live(db, comp_id=comp_id, hotkey=hotkey, task_id=None)
+        await _dash_rows_cache.upsert_frozen_rows(comp_id, hotkey, live_rows)
+        return _dash_rows_cache.filter_rows_for_task(live_rows, task_id)
+
+    live_rows = await _fetch_swe_rows_live(db, comp_id=comp_id, hotkey=hotkey, task_id=None)
+    status_overrides = await _build_swe_status_overrides(db, comp_id=comp_id, hotkeys={hotkey})
+    if status_overrides.get(hotkey) == "scored":
+        await _dash_rows_cache.upsert_frozen_rows(comp_id, hotkey, live_rows)
+    return _dash_rows_cache.filter_rows_for_task(live_rows, task_id)
+
+
+async def _fetch_swe_rows_live(
     db: AsyncSession,
     *,
     comp_id: int,
