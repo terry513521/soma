@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import sqlalchemy as sa
@@ -172,8 +173,19 @@ class SweMinersSnapshot:
     miners_by_hotkey: dict[str, SweMinerSnapshotItem]
 
 
+@dataclass(slots=True)
+class SweRowsSnapshot:
+    comp_id: int
+    rows: list[sa.Row]
+    rows_by_hotkey: dict[str, list[sa.Row]]
+    task_categories: dict[str, str]
+
+
+SWE_ROWS_SNAPSHOT_CACHE_VERSION = "v1"
 SWE_MINERS_SNAPSHOT_CACHE_VERSION = "v1"
+SWE_ROWS_SNAPSHOT_TTL_SECONDS = 300
 SWE_MINERS_SNAPSHOT_TTL_SECONDS = 300
+_swe_rows_snapshot_build_lock = asyncio.Lock()
 
 
 def _invalid_api_key_error() -> HTTPException:
@@ -400,6 +412,48 @@ async def _ensure_competition_exists(db: AsyncSession, comp_id: int) -> None:
         )
 
 
+def _swe_rows_snapshot_cache_key(comp_id: int) -> str:
+    return f"swe_rows_snapshot_{SWE_ROWS_SNAPSHOT_CACHE_VERSION}_{comp_id}"
+
+
+async def _build_swe_rows_snapshot(
+    db: AsyncSession,
+    *,
+    comp_id: int,
+) -> SweRowsSnapshot:
+    rows = await _fetch_swe_rows_live(db, comp_id=comp_id)
+    rows_by_hotkey: dict[str, list[sa.Row]] = {}
+    for row in rows:
+        rows_by_hotkey.setdefault(str(row.hotkey), []).append(row)
+
+    return SweRowsSnapshot(
+        comp_id=comp_id,
+        rows=rows,
+        rows_by_hotkey=rows_by_hotkey,
+        task_categories=_derive_swe_task_categories(rows),
+    )
+
+
+async def _get_swe_rows_snapshot(
+    db: AsyncSession,
+    *,
+    comp_id: int,
+) -> SweRowsSnapshot:
+    cache_key = _swe_rows_snapshot_cache_key(comp_id)
+    _cached = await _cache.get(cache_key)
+    if isinstance(_cached, SweRowsSnapshot):
+        return _cached
+
+    async with _swe_rows_snapshot_build_lock:
+        _cached = await _cache.get(cache_key)
+        if isinstance(_cached, SweRowsSnapshot):
+            return _cached
+
+        snapshot = await _build_swe_rows_snapshot(db, comp_id=comp_id)
+        await _cache.set(cache_key, snapshot, ttl=SWE_ROWS_SNAPSHOT_TTL_SECONDS)
+        return snapshot
+
+
 async def _fetch_swe_rows(
     db: AsyncSession,
     *,
@@ -407,23 +461,12 @@ async def _fetch_swe_rows(
     hotkey: str | None = None,
     task_id: int | None = None,
 ) -> list[sa.Row]:
+    snapshot = await _get_swe_rows_snapshot(db, comp_id=comp_id)
     if hotkey is None:
-        return await _fetch_swe_rows_live(db, comp_id=comp_id, hotkey=hotkey, task_id=task_id)
-
-    if await _dash_rows_cache.is_hotkey_frozen(comp_id, hotkey):
-        cached_rows = await _dash_rows_cache.get_cached_rows(comp_id, hotkey)
-        if cached_rows is not None:
-            return _dash_rows_cache.filter_rows_for_task(cached_rows, task_id)
-
-        live_rows = await _fetch_swe_rows_live(db, comp_id=comp_id, hotkey=hotkey, task_id=None)
-        await _dash_rows_cache.upsert_frozen_rows(comp_id, hotkey, live_rows)
-        return _dash_rows_cache.filter_rows_for_task(live_rows, task_id)
-
-    live_rows = await _fetch_swe_rows_live(db, comp_id=comp_id, hotkey=hotkey, task_id=None)
-    status_overrides = await _build_swe_status_overrides(db, comp_id=comp_id, hotkeys={hotkey})
-    if status_overrides.get(hotkey) == "scored":
-        await _dash_rows_cache.upsert_frozen_rows(comp_id, hotkey, live_rows)
-    return _dash_rows_cache.filter_rows_for_task(live_rows, task_id)
+        return _dash_rows_cache.filter_rows_for_task(snapshot.rows, task_id)
+    return _dash_rows_cache.filter_rows_for_task(
+        snapshot.rows_by_hotkey.get(str(hotkey), []), task_id
+    )
 
 
 async def _fetch_swe_rows_live(
@@ -535,9 +578,8 @@ async def _fetch_swe_task_categories(
     *,
     comp_id: int,
 ) -> dict[str, str]:
-    return _derive_swe_task_categories(
-        await _fetch_swe_rows(db, comp_id=comp_id)
-    )
+    snapshot = await _get_swe_rows_snapshot(db, comp_id=comp_id)
+    return dict(snapshot.task_categories)
 
 
 async def _resolve_swe_task_id(
@@ -598,9 +640,9 @@ async def _build_swe_miners_snapshot(
     *,
     comp_id: int,
 ) -> SweMinersSnapshot:
-    rows = await _fetch_swe_rows(db, comp_id=comp_id)
+    rows_snapshot = await _get_swe_rows_snapshot(db, comp_id=comp_id)
     miner_rows: dict[str, list[sa.Row]] = {}
-    for row in rows:
+    for row in rows_snapshot.rows:
         miner_rows.setdefault(str(row.hotkey), []).append(row)
 
     min_resolved = settings.screener_min_resolved
@@ -609,7 +651,7 @@ async def _build_swe_miners_snapshot(
             db, competition_id=comp_id, min_resolved=min_resolved
         )
     )
-    task_categories = _derive_swe_task_categories(rows)
+    task_categories = rows_snapshot.task_categories
 
     miners_by_hotkey: dict[str, SweMinerSnapshotItem] = {}
     for hotkey, task_rows in miner_rows.items():
