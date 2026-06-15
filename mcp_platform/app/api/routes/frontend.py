@@ -430,12 +430,6 @@ async def _fetch_swe_rows(
             miner_validations.c.run_fk == miner_runs.c.id,
         )
         .where(SWE_BENCH_TASKS.c.competition_fk == comp_id)
-        .order_by(
-            SWE_BENCH_TASKS.c.instance_id.asc(),
-            Miner.ss58.asc(),
-            miner_runs.c.attempt_no.asc(),
-            miner_runs.c.id.asc(),
-        )
     )
 
     if hotkey is not None:
