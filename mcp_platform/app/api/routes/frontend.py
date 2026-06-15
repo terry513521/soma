@@ -86,6 +86,7 @@ from app.services.swe_difficulty_calculator import (
     build_miner_category_scores,
     derive_task_difficulties,
 )
+from app.services.dash_rows_cache import DashRowsFrozenCache
 from app.db.interfaces import fetch_swebench_eligible_ss58_for_competition
 from app.api.routes.utils import (
     _get_current_burn_state,
@@ -96,6 +97,7 @@ from app.api.routes.utils import (
 logger = get_logger(__name__)
 _cache = Cache(Cache.MEMORY)
 _rate_limit_cache = Cache(Cache.MEMORY, namespace="frontend_api_key_rate_limit")
+_dash_rows_cache = DashRowsFrozenCache()
 TEXT_HIDDEN_PLACEHOLDER = "Will be available after uploads finish"
 API_KEY_HEADER = "x-api-key"
 
@@ -151,6 +153,27 @@ class FrontendApiKeyContext:
     prefix: str
     rate_limit_rpm: int | None
     rate_limit_rpd: int | None
+
+
+@dataclass(slots=True)
+class SweMinerSnapshotItem:
+    hotkey: str
+    total_score: float | None
+    screener_passed: bool
+    category_scores: dict[str, float] | None
+    task_count: int
+    screener_task_count: int
+
+
+@dataclass(slots=True)
+class SweMinersSnapshot:
+    comp_id: int
+    ordered_hotkeys: list[str]
+    miners_by_hotkey: dict[str, SweMinerSnapshotItem]
+
+
+SWE_MINERS_SNAPSHOT_CACHE_VERSION = "v1"
+SWE_MINERS_SNAPSHOT_TTL_SECONDS = 300
 
 
 def _invalid_api_key_error() -> HTTPException:
@@ -384,6 +407,32 @@ async def _fetch_swe_rows(
     hotkey: str | None = None,
     task_id: int | None = None,
 ) -> list[sa.Row]:
+    if hotkey is None:
+        return await _fetch_swe_rows_live(db, comp_id=comp_id, hotkey=hotkey, task_id=task_id)
+
+    if await _dash_rows_cache.is_hotkey_frozen(comp_id, hotkey):
+        cached_rows = await _dash_rows_cache.get_cached_rows(comp_id, hotkey)
+        if cached_rows is not None:
+            return _dash_rows_cache.filter_rows_for_task(cached_rows, task_id)
+
+        live_rows = await _fetch_swe_rows_live(db, comp_id=comp_id, hotkey=hotkey, task_id=None)
+        await _dash_rows_cache.upsert_frozen_rows(comp_id, hotkey, live_rows)
+        return _dash_rows_cache.filter_rows_for_task(live_rows, task_id)
+
+    live_rows = await _fetch_swe_rows_live(db, comp_id=comp_id, hotkey=hotkey, task_id=None)
+    status_overrides = await _build_swe_status_overrides(db, comp_id=comp_id, hotkeys={hotkey})
+    if status_overrides.get(hotkey) == "scored":
+        await _dash_rows_cache.upsert_frozen_rows(comp_id, hotkey, live_rows)
+    return _dash_rows_cache.filter_rows_for_task(live_rows, task_id)
+
+
+async def _fetch_swe_rows_live(
+    db: AsyncSession,
+    *,
+    comp_id: int,
+    hotkey: str | None = None,
+    task_id: int | None = None,
+) -> list[sa.Row]:
     baseline_runs = SWE_BENCH_RUNS.alias("baseline_runs")
     baseline_validations = SWE_BENCH_RUN_VALIDATIONS.alias("baseline_validations")
     miner_runs = SWE_BENCH_RUNS.alias("miner_runs")
@@ -529,6 +578,84 @@ async def _resolve_swe_task_id_or_name(
             return task_id
 
     return await _resolve_swe_task_id(db, comp_id=comp_id, task_name=task_name)
+
+
+def _swe_miner_snapshot_sort_key(item: SweMinerSnapshotItem) -> tuple[bool, float, bool, str]:
+    return (
+        item.total_score is None,
+        -(item.total_score or 0.0),
+        not item.screener_passed,
+        item.hotkey,
+    )
+
+
+def _swe_miners_snapshot_cache_key(comp_id: int) -> str:
+    return f"swe_miners_snapshot_{SWE_MINERS_SNAPSHOT_CACHE_VERSION}_{comp_id}"
+
+
+async def _build_swe_miners_snapshot(
+    db: AsyncSession,
+    *,
+    comp_id: int,
+) -> SweMinersSnapshot:
+    rows = await _fetch_swe_rows(db, comp_id=comp_id)
+    miner_rows: dict[str, list[sa.Row]] = {}
+    for row in rows:
+        miner_rows.setdefault(str(row.hotkey), []).append(row)
+
+    min_resolved = settings.screener_min_resolved
+    eligible_hotkeys = set(
+        await fetch_swebench_eligible_ss58_for_competition(
+            db, competition_id=comp_id, min_resolved=min_resolved
+        )
+    )
+    task_categories = _derive_swe_task_categories(rows)
+
+    miners_by_hotkey: dict[str, SweMinerSnapshotItem] = {}
+    for hotkey, task_rows in miner_rows.items():
+        task_groups = build_swe_task_groups(task_rows)
+        total_score, _ = build_swe_miner_scores(task_groups)
+        category_scores = _clean_swe_category_scores(
+            build_swe_category_scores(task_groups, task_categories)
+        )
+        miners_by_hotkey[hotkey] = SweMinerSnapshotItem(
+            hotkey=hotkey,
+            total_score=total_score,
+            screener_passed=hotkey in eligible_hotkeys,
+            category_scores=category_scores,
+            task_count=len(task_groups),
+            screener_task_count=sum(
+                1 for group in task_groups.values() if bool(group["is_screener"])
+            ),
+        )
+
+    ordered_hotkeys = [
+        item.hotkey
+        for item in sorted(
+            miners_by_hotkey.values(),
+            key=_swe_miner_snapshot_sort_key,
+        )
+    ]
+    return SweMinersSnapshot(
+        comp_id=comp_id,
+        ordered_hotkeys=ordered_hotkeys,
+        miners_by_hotkey=miners_by_hotkey,
+    )
+
+
+async def _get_swe_miners_snapshot(
+    db: AsyncSession,
+    *,
+    comp_id: int,
+) -> SweMinersSnapshot:
+    cache_key = _swe_miners_snapshot_cache_key(comp_id)
+    _cached = await _cache.get(cache_key)
+    if isinstance(_cached, SweMinersSnapshot):
+        return _cached
+
+    snapshot = await _build_swe_miners_snapshot(db, comp_id=comp_id)
+    await _cache.set(cache_key, snapshot, ttl=SWE_MINERS_SNAPSHOT_TTL_SECONDS)
+    return snapshot
 
 
 def _required_screener_task_passes(total_screener_tasks: int) -> int:
@@ -1977,56 +2104,24 @@ async def list_swe_miners_by_competition(
     limit: int = Query(default=20, ge=1, le=400),
 ) -> SweMinersListResponse:
     await _ensure_competition_exists(db, comp_id)
-    rows = await _fetch_swe_rows(db, comp_id=comp_id)
-    miner_rows: dict[str, list[sa.Row]] = {}
-
-    for row in rows:
-        miner_rows.setdefault(str(row.hotkey), []).append(row)
-
-    min_resolved = settings.screener_min_resolved
-    eligible_hotkeys = set(
-        await fetch_swebench_eligible_ss58_for_competition(
-            db, competition_id=comp_id, min_resolved=min_resolved
-        )
-    )
-    task_categories = _derive_swe_task_categories(rows)
-
-    grouped: dict[str, dict[str, object]] = {}
-    for hotkey, task_rows in miner_rows.items():
-        task_groups = build_swe_task_groups(task_rows)
-        total_score, _ = build_swe_miner_scores(task_groups)
-        category_scores = _clean_swe_category_scores(
-            build_swe_category_scores(task_groups, task_categories)
-        )
-        grouped[hotkey] = {
-            "hotkey": hotkey,
-            "total_score": total_score,
-            "screener_passed": hotkey in eligible_hotkeys,
-            "category_scores": category_scores,
-        }
-
-    sorted_miners = sorted(
-        grouped.values(),
-        key=lambda item: (
-            item["total_score"] is None,
-            -(item["total_score"] or 0.0),
-            not item["screener_passed"],
-            item["hotkey"],
-        ),
-    )
-
-    total_value = len(sorted_miners)
+    snapshot = await _get_swe_miners_snapshot(db, comp_id=comp_id)
+    total_value = len(snapshot.ordered_hotkeys)
     total_pages = max(1, ceil(total_value / limit)) if total_value else 1
     offset = (page - 1) * limit
-    selected_miners = sorted_miners[offset : offset + limit]
+    selected_hotkeys = snapshot.ordered_hotkeys[offset : offset + limit]
+    selected_miners = [
+        snapshot.miners_by_hotkey[hotkey]
+        for hotkey in selected_hotkeys
+        if hotkey in snapshot.miners_by_hotkey
+    ]
 
     return SweMinersListResponse(
         miners=[
             SweMinerLeaderboardItem(
-                hotkey=str(item["hotkey"]),
-                total_score=item["total_score"],
-                screener_passed=bool(item["screener_passed"]),
-                category_scores=item["category_scores"],
+                hotkey=item.hotkey,
+                total_score=item.total_score,
+                screener_passed=item.screener_passed,
+                category_scores=item.category_scores,
             )
             for item in selected_miners
         ],
@@ -2050,37 +2145,22 @@ async def get_swe_miner_by_competition(
     db: AsyncSession = Depends(get_db_session),
 ) -> SweMinerSummaryResponse:
     await _ensure_competition_exists(db, comp_id)
-    rows = await _fetch_swe_rows(db, comp_id=comp_id, hotkey=hotkey)
-    if not rows:
+    snapshot = await _get_swe_miners_snapshot(db, comp_id=comp_id)
+    item = snapshot.miners_by_hotkey.get(hotkey)
+    if item is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Miner not found in this competition",
         )
 
-    task_groups = build_swe_task_groups(rows)
-    task_items = [build_swe_task_result_item(group) for group in task_groups.values()]
-    total_score, _ = build_swe_miner_scores(task_groups)
-
-    task_categories = await _fetch_swe_task_categories(db, comp_id=comp_id)
-    category_scores = _clean_swe_category_scores(
-        build_swe_category_scores(task_groups, task_categories)
-    )
-
-    min_resolved = settings.screener_min_resolved
-    eligible_hotkeys = set(
-        await fetch_swebench_eligible_ss58_for_competition(
-            db, competition_id=comp_id, min_resolved=min_resolved
-        )
-    )
-
     return SweMinerSummaryResponse(
         miner=SweMinerSummary(
             hotkey=hotkey,
-            total_score=total_score,
-            screener_passed=hotkey in eligible_hotkeys,
-            category_scores=category_scores,
-            task_count=len(task_items),
-            screener_task_count=sum(1 for item in task_items if item.is_screener),
+            total_score=item.total_score,
+            screener_passed=item.screener_passed,
+            category_scores=item.category_scores,
+            task_count=item.task_count,
+            screener_task_count=item.screener_task_count,
         )
     )
 
