@@ -1144,11 +1144,7 @@ async def get_active_competitions(
     ]
 
 
-@frontend_router.get(
-    "/competition/{competition_id}/aggregate",
-    response_model=SweCompetitionAggregateResponse,
-)
-async def get_competition_aggregate(
+async def _get_competition_aggregate_impl(
     request: Request,
     db: AsyncSession = Depends(get_db_session),
     competition_id: int = Path(..., ge=1),
@@ -2600,6 +2596,24 @@ router = APIRouter(
     tags=["frontend"],
     dependencies=[Depends(_require_private_network)],
 )
+
+
+@router.get(
+    "/competition/{competition_id}/aggregate",
+    response_model=SweCompetitionAggregateResponse,
+)
+async def get_competition_aggregate(
+    request: Request,
+    db: AsyncSession = Depends(get_db_session),
+    competition_id: int = Path(..., ge=1),
+) -> SweCompetitionAggregateResponse:
+    return await _get_competition_aggregate_impl(
+        request=request,
+        db=db,
+        competition_id=competition_id,
+    )
+
+
 router.include_router(frontend_router)
 
 api_key_router = APIRouter(
