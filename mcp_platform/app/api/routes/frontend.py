@@ -643,8 +643,10 @@ async def _build_swe_miners_snapshot(
     db: AsyncSession,
     *,
     comp_id: int,
+    rows_snapshot: SweRowsSnapshot | None = None,
 ) -> SweMinersSnapshot:
-    rows_snapshot = await _get_swe_rows_snapshot(db, comp_id=comp_id)
+    if rows_snapshot is None:
+        rows_snapshot = await _get_swe_rows_snapshot(db, comp_id=comp_id)
     miner_rows: dict[str, list[sa.Row]] = {}
     for row in rows_snapshot.rows:
         miner_rows.setdefault(str(row.hotkey), []).append(row)
@@ -1151,11 +1153,6 @@ async def get_competition_aggregate(
     db: AsyncSession = Depends(get_db_session),
     competition_id: int = Path(..., ge=1),
 ) -> SweCompetitionAggregateResponse:
-    cache_key = f"swe_competition_aggregate_{competition_id}"
-    _cached = await _cache.get(cache_key)
-    if _cached is not None:
-        return _cached
-
     competition_name = await db.scalar(
         select(Competition.competition_name).where(Competition.id == competition_id)
     )
@@ -1216,8 +1213,12 @@ async def get_competition_aggregate(
         upload_ends_at = upload_ends_at.replace(tzinfo=timezone.utc)
     eval_started = upload_ends_at is not None and datetime.now(timezone.utc) >= upload_ends_at
 
-    miners_snapshot = await _get_swe_miners_snapshot(db, comp_id=competition_id)
-    rows_snapshot = await _get_swe_rows_snapshot(db, comp_id=competition_id)
+    rows_snapshot = await _build_swe_rows_snapshot(db, comp_id=competition_id)
+    miners_snapshot = await _build_swe_miners_snapshot(
+        db,
+        comp_id=competition_id,
+        rows_snapshot=rows_snapshot,
+    )
 
     miners: list[SweCompetitionMinerAggregateItem] = []
     for hotkey in miners_snapshot.ordered_hotkeys:
@@ -1313,7 +1314,6 @@ async def get_competition_aggregate(
         miners=miners,
         total_miners=len(miners),
     )
-    await _cache.set(cache_key, response, ttl=15)
 
     logger.info(
         "[Frontend] SWE competition aggregate: competition_id=%s, miners=%s",
