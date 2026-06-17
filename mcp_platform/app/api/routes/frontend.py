@@ -1203,6 +1203,11 @@ async def get_active_competitions(
         .where(SWE_BENCH_TASKS.c.competition_fk == Competition.id)
         .exists()
     )
+    has_compression_tasks = (
+        select(CompetitionChallenge.challenge_fk)
+        .where(CompetitionChallenge.competition_fk == Competition.id)
+        .exists()
+    )
 
     rows = (
         await db.execute(
@@ -1211,17 +1216,76 @@ async def get_active_competitions(
                 Competition.competition_name,
                 sa.case(
                     (has_swe_tasks, "swe"),
+                    (has_compression_tasks, "compression"),
                     else_="compression",
                 ).label("competition_type"),
-            ).order_by(Competition.id.asc())
+                CompetitionTimeframe.upload_starts_at.label("upload_start"),
+                CompetitionTimeframe.upload_ends_at.label("upload_end"),
+                CompetitionTimeframe.eval_starts_at.label("evaluation_start"),
+                CompetitionTimeframe.eval_ends_at.label("evaluation_end"),
+            )
+            .select_from(Competition)
+            .outerjoin(
+                CompetitionConfig,
+                CompetitionConfig.competition_fk == Competition.id,
+            )
+            .outerjoin(
+                CompetitionTimeframe,
+                CompetitionTimeframe.competition_config_fk == CompetitionConfig.id,
+            )
+            .order_by(Competition.id.desc())
         )
     ).all()
+
+    if not rows:
+        return []
+
+    latest_competition_id = int(rows[0].competition_id)
+    now_utc = datetime.now(timezone.utc)
+
+    def _normalize_utc(value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value
+
+    def _resolve_state(
+        *,
+        upload_start: datetime | None,
+        upload_end: datetime | None,
+        evaluation_start: datetime | None,
+        evaluation_end: datetime | None,
+    ) -> str:
+        if (
+            upload_start is None
+            or upload_end is None
+            or evaluation_start is None
+            or evaluation_end is None
+        ):
+            return "finished"
+        if now_utc >= evaluation_end:
+            return "finished"
+        if now_utc >= evaluation_start:
+            return "evaluation"
+        return "upload"
 
     return [
         MinerCompetitionItem(
             competition_id=int(row.competition_id),
             competition_name=row.competition_name,
             competition_type=str(row.competition_type),
+            state=_resolve_state(
+                upload_start=_normalize_utc(row.upload_start),
+                upload_end=_normalize_utc(row.upload_end),
+                evaluation_start=_normalize_utc(row.evaluation_start),
+                evaluation_end=_normalize_utc(row.evaluation_end),
+            ),
+            is_active=int(row.competition_id) == latest_competition_id,
+            upload_start=_normalize_utc(row.upload_start),
+            upload_end=_normalize_utc(row.upload_end),
+            evaluation_start=_normalize_utc(row.evaluation_start),
+            evaluation_end=_normalize_utc(row.evaluation_end),
         )
         for row in rows
     ]
