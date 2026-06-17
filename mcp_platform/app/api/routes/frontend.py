@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import hashlib
 import json
 import sqlalchemy as sa
@@ -9,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from math import ceil
 
 from aiocache import Cache
-from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, Response, status
 from fastapi.routing import APIRoute
 from sqlalchemy import func, select, and_
 from sqlalchemy.exc import SQLAlchemyError
@@ -2723,11 +2724,29 @@ async def get_competition_aggregate(
     request: Request,
     db: AsyncSession = Depends(get_db_session),
     competition_id: int = Path(..., ge=1),
-) -> SweCompetitionAggregateResponse:
-    return await _get_competition_aggregate_impl(
+    gzip_enabled: bool = Query(
+        default=False,
+        alias="gzip",
+        description="When true, response body is returned as gzip-compressed JSON.",
+    ),
+) -> SweCompetitionAggregateResponse | Response:
+    response = await _get_competition_aggregate_impl(
         request=request,
         db=db,
         competition_id=competition_id,
+    )
+    if not gzip_enabled:
+        return response
+
+    payload = response.model_dump_json().encode("utf-8")
+    compressed_payload = gzip.compress(payload)
+    return Response(
+        content=compressed_payload,
+        media_type="application/json",
+        headers={
+            "Content-Encoding": "gzip",
+            "Vary": "Accept-Encoding",
+        },
     )
 
 
