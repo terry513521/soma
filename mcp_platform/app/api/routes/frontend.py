@@ -185,6 +185,15 @@ class SweRowsSnapshot:
     task_categories: dict[str, str]
 
 
+@dataclass(slots=True)
+class SweCompetitionMinerMeta:
+    status: str
+    last_submit: datetime | None
+    registered_at: datetime | None
+    contests: int
+    rank: int | None
+
+
 SWE_ROWS_SNAPSHOT_CACHE_VERSION = "v1"
 SWE_MINERS_SNAPSHOT_CACHE_VERSION = "v1"
 SWE_ROWS_SNAPSHOT_TTL_SECONDS = 300
@@ -635,6 +644,17 @@ def _swe_miner_snapshot_sort_key(item: SweMinerSnapshotItem) -> tuple[bool, floa
     )
 
 
+def _build_scored_rank_map(
+    *,
+    items: list[tuple[str, float]],
+) -> dict[str, int]:
+    ordered = sorted(items, key=lambda item: (-item[1], item[0]))
+    return {
+        hotkey: idx
+        for idx, (hotkey, _total_score) in enumerate(ordered, start=1)
+    }
+
+
 def _swe_miners_snapshot_cache_key(comp_id: int) -> str:
     return f"swe_miners_snapshot_{SWE_MINERS_SNAPSHOT_CACHE_VERSION}_{comp_id}"
 
@@ -954,6 +974,68 @@ async def _build_swe_status_overrides(
     return status_by_hotkey
 
 
+async def _load_swe_aggregate_miner_meta(
+    db: AsyncSession,
+    *,
+    comp_id: int,
+    hotkeys: set[str],
+) -> dict[str, SweCompetitionMinerMeta]:
+    if not hotkeys:
+        return {}
+
+    contests_sq = (
+        select(
+            MV_MINER_STATUS.c.ss58.label("ss58"),
+            func.count(func.distinct(MV_MINER_STATUS.c.competition_id)).label("contests"),
+        )
+        .where(MV_MINER_STATUS.c.ss58.in_(hotkeys))
+        .group_by(MV_MINER_STATUS.c.ss58)
+        .subquery("miner_contests")
+    )
+
+    rows = (
+        await db.execute(
+            select(
+                Miner.ss58.label("ss58"),
+                Miner.created_at.label("registered_at"),
+                MV_MINER_STATUS.c.status.label("status"),
+                MV_MINER_STATUS.c.last_submit_at.label("last_submit_at"),
+                MV_MINER_COMPETITION_STATS.c.rank.label("rank"),
+                contests_sq.c.contests.label("contests"),
+            )
+            .select_from(Miner)
+            .outerjoin(
+                MV_MINER_STATUS,
+                and_(
+                    MV_MINER_STATUS.c.competition_id == comp_id,
+                    MV_MINER_STATUS.c.ss58 == Miner.ss58,
+                ),
+            )
+            .outerjoin(
+                MV_MINER_COMPETITION_STATS,
+                and_(
+                    MV_MINER_COMPETITION_STATS.c.competition_id == comp_id,
+                    MV_MINER_COMPETITION_STATS.c.ss58 == Miner.ss58,
+                ),
+            )
+            .outerjoin(contests_sq, contests_sq.c.ss58 == Miner.ss58)
+            .where(Miner.ss58.in_(hotkeys))
+        )
+    ).all()
+
+    metadata_by_hotkey: dict[str, SweCompetitionMinerMeta] = {}
+    for row in rows:
+        ss58 = str(row.ss58)
+        metadata_by_hotkey[ss58] = SweCompetitionMinerMeta(
+            status=str(row.status or "in queue"),
+            last_submit=row.last_submit_at,
+            registered_at=row.registered_at,
+            contests=int(row.contests or 0),
+            rank=int(row.rank) if row.rank is not None else None,
+        )
+    return metadata_by_hotkey
+
+
 async def _log_frontend_request_metrics(request: Request, status_code: int) -> None:
     request_id = getattr(request.state, "request_id", None)
     if not request_id:
@@ -1215,12 +1297,42 @@ async def _get_competition_aggregate_impl(
         comp_id=competition_id,
         rows_snapshot=rows_snapshot,
     )
+    hotkeys = set(miners_snapshot.ordered_hotkeys)
+    status_overrides = await _build_swe_status_overrides(
+        db,
+        comp_id=competition_id,
+        hotkeys=hotkeys,
+    )
+    metadata_by_hotkey = await _load_swe_aggregate_miner_meta(
+        db,
+        comp_id=competition_id,
+        hotkeys=hotkeys,
+    )
+    resolved_status_by_hotkey: dict[str, str] = {}
+    for hotkey in miners_snapshot.ordered_hotkeys:
+        miner_meta = metadata_by_hotkey.get(hotkey)
+        base_status = miner_meta.status if miner_meta is not None else "in queue"
+        resolved_status_by_hotkey[hotkey] = status_overrides.get(hotkey, base_status)
+
+    scored_rank_candidates: list[tuple[str, float]] = []
+    for hotkey in miners_snapshot.ordered_hotkeys:
+        miner_snapshot = miners_snapshot.miners_by_hotkey.get(hotkey)
+        if miner_snapshot is None:
+            continue
+        if resolved_status_by_hotkey.get(hotkey) != "scored":
+            continue
+        if miner_snapshot.total_score is None:
+            continue
+        scored_rank_candidates.append((hotkey, float(miner_snapshot.total_score)))
+    rank_by_hotkey = _build_scored_rank_map(items=scored_rank_candidates)
 
     miners: list[SweCompetitionMinerAggregateItem] = []
     for hotkey in miners_snapshot.ordered_hotkeys:
         miner_snapshot = miners_snapshot.miners_by_hotkey.get(hotkey)
         if miner_snapshot is None:
             continue
+        miner_meta = metadata_by_hotkey.get(hotkey)
+        miner_status = resolved_status_by_hotkey.get(hotkey, "in queue")
 
         miner_rows = rows_snapshot.rows_by_hotkey.get(hotkey, [])
         task_groups = build_swe_task_groups(miner_rows)
@@ -1289,6 +1401,11 @@ async def _get_competition_aggregate_impl(
                     task_count=miner_snapshot.task_count,
                     screener_task_count=miner_snapshot.screener_task_count,
                 ),
+                status=miner_status,
+                last_submit=miner_meta.last_submit if miner_meta is not None else None,
+                registered_at=miner_meta.registered_at if miner_meta is not None else None,
+                contests=miner_meta.contests if miner_meta is not None else 0,
+                rank=rank_by_hotkey.get(hotkey),
                 penalties=SweMinerPenaltySummary(
                     categories=penalties_categories,
                     total=(
