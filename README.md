@@ -1,4 +1,4 @@
-# SOMA
+https://thesoma.ai/# SOMA
 
 ![SOMA](docs/images/SOMA.jpg)
 

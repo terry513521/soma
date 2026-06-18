@@ -1,0 +1,34 @@
+```json
+{
+  "Problem": "The `makemigrations` command in Django 3.2.4 generates migration files that fail with `NameError: name 'models' is not defined` when a model's `bases` attribute includes `models.Model` alongside other custom mixins. The generated migration file is missing the `from django.db import models` import statement.",
+  "Evidence": [
+    "User provided `models.py` and the generated migration file snippet.",
+    "The failing line in the migration is `bases=(app.models.MyMixin, models.Model),`.",
+    "The error `NameError: name 'models' is not defined` confirms the missing import.",
+    "The `django/db/migrations/serializer.py` file contains `TypeSerializer` which handles the serialization of types.",
+    "Specifically, line 276 in `serializer.py` (before fix) was `(models.Model, \"models.Model\", []),` which serialized `models.Model` to the string `\"models.Model\"` but provided an empty list for imports, leading to the missing import statement in the generated migration."
+  ],
+  "Relevant Code": [
+    "/home/user/.openclaw/workspace/django/django/db/migrations/writer.py",
+    "/home/user/.openclaw/workspace/django/django/db/migrations/operations/models.py",
+    "/home/user/.openclaw/workspace/django/django/db/migrations/serializer.py"
+  ],
+  "Tests/Errors": [
+    "NameError: name 'models' is not defined",
+    "File \"/home/jj/django_example/app/migrations/0001_initial.py\", line 23, in Migration\n\tbases=(app.models.MyMixin, models.Model),"
+  ],
+  "Decisions": [
+    "The core issue is that `models.Model` is serialized without its corresponding import statement when it appears in the `bases` tuple of a `CreateModel` operation.",
+    "The `TypeSerializer` in `django/db/migrations/serializer.py` is responsible for this behavior.",
+    "The fix involves modifying the `TypeSerializer` to include `from django.db import models` in the imports when `models.Model` is serialized."
+  ],
+  "Patch Plan": [
+    "Modify `django/db/migrations/serializer.py`.",
+    "In the `TypeSerializer` class, locate the `special_cases` list.",
+    "Change the entry for `models.Model` from `(models.Model, \"models.Model\", []),` to `(models.Model, \"models.Model\", [\"from django.db import models\"]),`."
+  ],
+  "Risks": [
+    "Adding `from django.db import models` might cause redundant imports in some cases, but this is generally harmless and preferable to a `NameError`."
+  ]
+}
+```

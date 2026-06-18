@@ -28,8 +28,48 @@ except Exception:  # pragma: no cover - fallback for minimal local environments
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_MODEL = "google/gemini-2.5-flash"
-DEFAULT_COMPRESSION_RATIO = 0.2
+DEFAULT_COMPRESSION_RATIO = 0.45
 REQUEST_TIMEOUT_SECONDS = 120
+
+SYSTEM_PROMPT = (
+    "You are a SOMA trajectory compiler. Your input is an OpenClaw/SWE-bench coding-agent "
+    "trajectory: user requests, tool calls, tool outputs, file snippets, terminal results, "
+    "errors, hypotheses, and decisions. Compile it into handoff memory for the next coding "
+    "agent.\n\n"
+    "KEEP (preserve exactly or with minimal trimming):\n"
+    "- original bug/request and acceptance criteria\n"
+    "- important files, functions, classes, symbols, and config keys\n"
+    "- root cause and current diagnosis\n"
+    "- critical command outputs that changed understanding\n"
+    "- test failures, expected vs actual behavior, and stack traces\n"
+    "- constraints, environment facts, and blockers\n"
+    "- current fix direction and patch plan\n"
+    "- recent tool results and the commands that produced them\n\n"
+    "REMOVE or SUMMARIZE:\n"
+    "- duplicate logs and repeated context\n"
+    "- long irrelevant file dumps (keep only the relevant snippet)\n"
+    "- old failed attempts that no longer affect the next step\n"
+    "- verbose thinking and filler narration\n"
+    "- unimportant command output with no diagnostic value\n"
+    "- already-stated facts restated later in the trajectory\n\n"
+    "Rules:\n"
+    "- Never invent facts, files, tests, or conclusions.\n"
+    "- If uncertain, mark as uncertain instead of guessing.\n"
+    "- Prefer keeping recent evidence over old exploratory noise.\n"
+    "- Do not collapse everything into a tiny abstract summary.\n"
+    "- Keep tool/message structure when helpful; summarize only low-value sections.\n\n"
+    "Output only the compressed handoff. Useful sections: Bug/Request, Relevant "
+    "Files/Functions, Root Cause, Critical Commands/Outputs, Test Failures, Constraints, "
+    "Fix Direction, Recent Tool Results, Risks."
+)
+
+
+def build_user_prompt(text: str, target_tokens: int) -> str:
+    return (
+        f"Compress this OpenClaw agent trajectory to approximately {target_tokens} tokens. "
+        "Stay near that budget. Treat it as live repair state for the next SWE-bench agent.\n\n"
+        f"{text}"
+    )
 
 
 def main(task: str, compression_ratio: float | None = None) -> str:
@@ -61,43 +101,8 @@ def compress_with_openrouter(text: str, *, target_tokens: int, api_key: str) -> 
         "temperature": temperature,
         "max_tokens": max(256, min(8192, int(target_tokens * 1.15))),
         "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are a SOMA trajectory compiler. Your input is not ordinary text: "
-                    "it is an OpenClaw/SWE-bench coding-agent trajectory containing user "
-                    "requests, thoughts, tool calls, tool outputs, file snippets, terminal "
-                    "results, errors, hypotheses, and partial decisions. Your job is to "
-                    "compile that trajectory into dense handoff memory for the next coding "
-                    "agent.\n\n"
-                    "Goal: preserve everything needed for the next agent to create the "
-                    "correct patch, while deleting tokens that do not change the repair "
-                    "state.\n\n"
-                    "Never invent facts, files, test results, or conclusions. If evidence is "
-                    "uncertain, mark it as uncertain. Keep exact names for files, symbols, "
-                    "tests, errors, config keys, commands, and observed outputs.\n\n"
-                    "Prioritize in this order: original problem and acceptance criteria; "
-                    "failing tests/errors; relevant files/classes/functions; code behavior "
-                    "observed from tool outputs; constraints and environment facts; current "
-                    "diagnosis; patch plan; failed attempts that prevent repeated mistakes.\n\n"
-                    "Remove duplicated reasoning, social text, repeated logs, dead-end "
-                    "speculation without evidence, and verbose outputs after extracting "
-                    "their useful facts.\n\n"
-                    "Output only the compressed handoff. Use compact sections: Problem, "
-                    "Evidence, Relevant Code, Tests/Errors, Decisions, Patch Plan, Risks."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"Compress this OpenClaw agent trajectory to about {target_tokens} "
-                    "tokens or less. Treat it as live repair state, not as prose to "
-                    "summarize. If the budget is tight, prefer exact actionable evidence "
-                    "over narrative explanation. The next SWE-bench agent should be able "
-                    "to continue from your handoff and produce the correct patch.\n\n"
-                    f"{text}"
-                ),
-            },
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": build_user_prompt(text, target_tokens)},
         ],
     }
 

@@ -41,7 +41,7 @@ def main() -> None:
     parser.add_argument("data_path", help="Path to .jsonl, .json, .csv, or .txt data")
     parser.add_argument("--miner", default=str(DEFAULT_MINER), help="Path to miner python file")
     parser.add_argument("--field", default=None, help="Field/column containing text to compress")
-    parser.add_argument("--ratio", type=float, default=0.2, help="Compression ratio, e.g. 0.2")
+    parser.add_argument("--ratio", type=float, default=0.45, help="Compression ratio, e.g. 0.45")
     parser.add_argument("--limit", type=int, default=None, help="Maximum number of records to run")
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="Directory for outputs")
     args = parser.parse_args()

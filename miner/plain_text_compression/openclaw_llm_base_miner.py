@@ -44,6 +44,46 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_MODEL = "google/gemini-2.5-flash"
 STATE_VERSION = 1
 
+SYSTEM_PROMPT = (
+    "You are a SOMA trajectory compiler. Your input is an OpenClaw/SWE-bench coding-agent "
+    "trajectory: user requests, tool calls, tool outputs, file snippets, terminal results, "
+    "errors, hypotheses, and decisions. Compile it into handoff memory for the next coding "
+    "agent.\n\n"
+    "KEEP (preserve exactly or with minimal trimming):\n"
+    "- original bug/request and acceptance criteria\n"
+    "- important files, functions, classes, symbols, and config keys\n"
+    "- root cause and current diagnosis\n"
+    "- critical command outputs that changed understanding\n"
+    "- test failures, expected vs actual behavior, and stack traces\n"
+    "- constraints, environment facts, and blockers\n"
+    "- current fix direction and patch plan\n"
+    "- recent tool results and the commands that produced them\n\n"
+    "REMOVE or SUMMARIZE:\n"
+    "- duplicate logs and repeated context\n"
+    "- long irrelevant file dumps (keep only the relevant snippet)\n"
+    "- old failed attempts that no longer affect the next step\n"
+    "- verbose thinking and filler narration\n"
+    "- unimportant command output with no diagnostic value\n"
+    "- already-stated facts restated later in the trajectory\n\n"
+    "Rules:\n"
+    "- Never invent facts, files, tests, or conclusions.\n"
+    "- If uncertain, mark as uncertain instead of guessing.\n"
+    "- Prefer keeping recent evidence over old exploratory noise.\n"
+    "- Do not collapse everything into a tiny abstract summary.\n"
+    "- Keep tool/message structure when helpful; summarize only low-value sections.\n\n"
+    "Output only the compressed handoff. Useful sections: Bug/Request, Relevant "
+    "Files/Functions, Root Cause, Critical Commands/Outputs, Test Failures, Constraints, "
+    "Fix Direction, Recent Tool Results, Risks."
+)
+
+
+def build_user_prompt(text: str, target_tokens: int) -> str:
+    return (
+        f"Compress this OpenClaw trajectory to approximately {target_tokens} tokens. "
+        "Stay near that budget. Treat it as live repair state for the next SWE-bench agent.\n\n"
+        f"{text}"
+    )
+
 
 def handle_assemble(payload: dict[str, Any]) -> dict[str, Any]:
     params = get_params(payload)
@@ -167,30 +207,8 @@ def compress_with_openrouter(text: str, *, target_tokens: int, api_key: str) -> 
         "temperature": env_float("SOMA_LLM_TEMPERATURE", 0.1),
         "max_tokens": max(256, min(8192, int(target_tokens * 1.15))),
         "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are a SOMA trajectory compiler. Your input is an OpenClaw/SWE-bench "
-                    "agent trajectory with user requests, tool calls, file snippets, terminal "
-                    "results, errors, hypotheses, and partial decisions. Compile it into dense "
-                    "handoff memory for the next coding agent.\n\n"
-                    "Preserve exact issue requirements, file paths, symbols, tests, commands, "
-                    "errors, observed behavior, constraints, diagnosis, patch plan, and failed "
-                    "attempts that prevent repeated mistakes. Never invent facts. Mark uncertain "
-                    "evidence as uncertain. Remove duplicated reasoning, filler, and verbose logs "
-                    "after extracting useful facts.\n\n"
-                    "Output only compact sections: Problem, Evidence, Relevant Code, Tests/Errors, "
-                    "Decisions, Patch Plan, Risks."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"Compress this OpenClaw trajectory to about {target_tokens} tokens or less. "
-                    "It will be used as live repair state by the next SWE-bench coding agent.\n\n"
-                    f"{text}"
-                ),
-            },
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": build_user_prompt(text, target_tokens)},
         ],
     }
     request = urllib.request.Request(

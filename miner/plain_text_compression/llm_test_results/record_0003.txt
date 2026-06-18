@@ -1,0 +1,108 @@
+Problem: `dbshell` additional parameters are passed *after* the database name on PostgreSQL, but `psql` expects all options to precede the database name. This results in `psql` ignoring the additional parameters.
+
+Evidence:
+- User report: `psql: warning: extra command-line argument "-c" ignored`
+- Code in `django/db/backends/postgresql/client.py` shows `dbname` being added to `args` before `parameters` are extended.
+- `test_parameters` in `tests/dbshell/test_postgresql.py` initially reflected the incorrect order.
+
+Relevant Code:
+File: `django/db/backends/postgresql/client.py`
+```python
+class DatabaseClient(BaseDatabaseClient):
+    executable_name = "psql"
+
+    @classmethod
+    def settings_to_cmd_args_env(cls, settings_dict, parameters):
+        args = [cls.executable_name]
+        options = settings_dict.get("OPTIONS", {})
+
+        host = settings_dict.get("HOST")
+        port = settings_dict.get("PORT")
+        dbname = settings_dict.get("NAME")
+        user = settings_dict.get("USER")
+        passwd = settings_dict.get("PASSWORD")
+        passfile = options.get("passfile")
+        service = options.get("service")
+        sslmode = options.get("sslmode")
+        sslrootcert = options.get("sslrootcert")
+        sslcert = options.get("sslcert")
+        sslkey = options.get("sslkey")
+
+        if not dbname and not service:
+            # Connect to the default 'postgres' db.
+            dbname = "postgres"
+        if user:
+            args += ["-U", user]
+        if host:
+            args += ["-h", host]
+        if port:
+            args += ["-p", str(port)]
+        if dbname:
+            args += [dbname] # <-- This line is the problem
+        args.extend(parameters) # <-- This line is the problem
+
+        env = {}
+        if passwd:
+            env["PGPASSWORD"] = str(passwd)
+        if service:
+            env["PGSERVICE"] = str(service)
+        if sslmode:
+            env["PGSSLMODE"] = str(sslmode)
+        if sslrootcert:
+            env["PGSSLROOTCERT"] = str(sslrootcert)
+        if sslcert:
+            env["PGSSLCERT"] = str(sslcert)
+        if sslkey:
+            env["PGSSLKEY"] = str(sslkey)
+        if passfile:
+            env["PGPASSFILE"] = str(passfile)
+        return args, (env or None)
+```
+
+File: `tests/dbshell/test_postgresql.py`
+```python
+    def test_parameters(self):
+        self.assertEqual(
+            self.settings_to_cmd_args_env({"NAME": "dbname"}, ["--help"]),
+            (["psql", "dbname", "--help"], None), # <-- This line needs to be updated
+        )
+```
+
+Tests/Errors:
+- Initial `pytest` runs failed due to `ImproperlyConfigured: Requested setting DATABASES, but settings are not configured.` and `ModuleNotFoundError: No module named 'tests.settings'`. This indicates a missing `DJANGO_SETTINGS_MODULE` or incorrect pytest invocation.
+- A direct Python script was used to verify the fix:
+```python
+from django.db.backends.postgresql.client import DatabaseClient
+
+# Test basic without parameters
+args, env = DatabaseClient.settings_to_cmd_args_env({'NAME': 'dbname', 'USER': 'someuser', 'HOST': 'somehost', 'PORT': '444'}, [])
+assert args == ['psql', '-U', 'someuser', '-h', 'somehost', '-p', '444', 'dbname'], args
+
+# Test with parameters - parameters BEFORE dbname
+args, env = DatabaseClient.settings_to_cmd_args_env({'NAME': 'dbname'}, ['--help'])
+assert args == ['psql', '--help', 'dbname'], args
+
+# Test with parameters and no dbname (defaults to postgres)
+args, env = DatabaseClient.settings_to_cmd_args_env({}, ['-c', 'select 1'])
+assert args == ['psql', '-c', 'select 1', 'postgres'], args
+
+# Test with -c parameter (the original bug report scenario)
+args, env = DatabaseClient.settings_to_cmd_args_env({'NAME': 'some_database'}, ['-c', 'select * from some_table;'])
+assert args == ['psql', '-c', 'select * from some_table;', 'some_database'], args
+
+print('All tests passed!')
+```
+- This direct script passed, confirming the fix and the updated test expectation.
+
+Decisions:
+- The core issue is the order of arguments passed to `psql`. The `parameters` list must be added to the command arguments *before* the `dbname`.
+- The existing test `test_parameters` in `test_postgresql.py` needs to be updated to reflect this correct order.
+
+Patch Plan:
+1. Modify `django/db/backends/postgresql/client.py`:
+   - Move `args.extend(parameters)` to occur before `if dbname: args += [dbname]`.
+2. Modify `tests/dbshell/test_postgresql.py`:
+   - Update `test_parameters` to assert `(["psql", "--help", "dbname"], None)` instead of `(["psql", "dbname", "--help"], None)`.
+
+Risks:
+- The `pytest` environment setup is not fully understood, leading to manual verification. This might indicate other tests could be failing if run in a full test suite. However, the direct Python script verification covers the specific logic changed.

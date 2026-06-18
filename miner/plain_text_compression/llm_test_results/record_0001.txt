@@ -1,0 +1,99 @@
+The user reported an issue with the `urlize` function not correctly handling HTML-escaped strings and trailing punctuation.
+
+**Bug/Request:**
+`urlize('Search for google.com/?q=1&lt! and see.')`
+Expected output: `'Search for <a href="http://google.com/?q=1%3C">google.com/?q=1&lt</a>! and see.'`
+Actual output: `'Search for <a href="http://google.com/?q=1%3C">google.com/?q=1&lt</a>lt! and see.'`
+
+The problem is that the `lt!` part is incorrectly included in the link text, instead of just the `!` being treated as trailing punctuation.
+
+**Relevant Files/Functions:**
+- `/home/user/.openclaw/workspace/django/django/utils/html.py`: Contains the `urlize` function.
+- `urlize` function: The main function to be fixed.
+- `trim_punctuation` function (within `urlize`): This is where the core logic error lies.
+
+**Root Cause:**
+The `trim_punctuation` function attempts to strip trailing punctuation. It works by:
+1. Unescaping the `middle` part of the URL (`middle_unescaped = html.unescape(middle)`).
+2. Stripping trailing punctuation from the unescaped string (`stripped = middle_unescaped.rstrip(TRAILING_PUNCTUATION_CHARS)`).
+3. If characters were stripped from `middle_unescaped`, it tries to apply the same stripping to the original `middle` string.
+
+The bug occurs in step 3 when calculating the `trail` and `middle` parts:
+```python
+            trail = middle[len(stripped):] + trail
+            middle = middle[:len(stripped) - len(middle_unescaped)]
+```
+When `middle = 'google.com/?q=1&lt!'`:
+- `middle_unescaped` becomes `'google.com/?q=1<!'` (because `&lt` unescapes to `<`).
+- `stripped` becomes `'google.com/?q=1<'` (the `!` is stripped from the unescaped string).
+- `len(stripped)` is 16, `len(middle_unescaped)` is 17.
+- The original code calculates `trail = middle[16:] + trail`. Since `middle[16:]` is `'lt!'`, the `lt!` is incorrectly moved to the `trail`.
+- The original code calculates `middle = middle[:16 - 17]` which is `middle[:-1]`, resulting in `'google.com/?q=1&lt'`.
+
+The issue is that `len(stripped)` (length of the unescaped and stripped string) is used to index into the *original* `middle` string, which has a different length due to HTML entities. This leads to incorrect slicing.
+
+**Critical Commands/Outputs:**
+```
+# Tracing the original logic with the problematic input
+python3 -c "\nmiddle = 'google.com/?q=1&lt!'\nimport html\nTRAILING = '.,:;!'\nmiddle_unescaped = html.unescape(middle)\nstripped = middle_unescaped.rstrip(TRAILING)\nprint('stripped != middle_unescaped:', middle_unescaped != stripped)\nif middle_unescaped != stripped:\n    trail = middle[len(stripped):]\n    new_middle = middle[:len(stripped) - len(middle_unescaped)]\n    print('trail:', repr(trail))\n    print('new_middle:', repr(new_middle))\n"
+# Output:
+# stripped != middle_unescaped: True
+# trail: 'lt!'
+# new_middle: 'google.com/?q=1&lt'
+```
+This output clearly shows `lt!` being incorrectly assigned to `trail`.
+
+**Fix Direction:**
+Instead of using `len(stripped)` to index into `middle`, calculate the *number of characters removed* from the unescaped string (`trail_length = len(middle_unescaped) - len(stripped)`). Then, remove this `trail_length` from the *end* of the original `middle` string.
+
+**Patch Plan:**
+Modify the `trim_punctuation` function in `django/django/utils/html.py` as follows:
+
+```diff
+--- a/django/django/utils/html.py
++++ b/django/django/utils/html.py
+@@ -66,8 +66,9 @@
+             # as encoded entities contain ';'). Unescape entities to avoid
+             # breaking them by removing ';'.
+             middle_unescaped = html.unescape(middle)
+             stripped = middle_unescaped.rstrip(TRAILING_PUNCTUATION_CHARS)
+             if middle_unescaped != stripped:
+-                trail = middle[len(stripped):] + trail
+-                middle = middle[:len(stripped) - len(middle_unescaped)]
++                trail_length = len(middle_unescaped) - len(stripped)
++                trail = middle[len(middle) - trail_length:] + trail
++                middle = middle[:len(middle) - trail_length]
+                 trimmed_something = True
+         return lead, middle, trail
+```
+
+**Recent Tool Results (Verification of Fix):**
+```
+# Test with the proposed fix logic
+cd /home/user/.openclaw/workspace/django && python3 << 'EOF'
+import html, re
+
+TRAILING_PUNCTUATION_CHARS = '.,:;!'
+WRAPPING_PUNCTUATION = [('(', ')'), ('[', ']'), ('<', '>'), ('\"', '\"'), ("'", "'")]
+
+def trim_punctuation(lead, middle, trail):\n    trimmed_something = True\n    while trimmed_something:\n        trimmed_something = False\n        for opening, closing in WRAPPING_PUNCTUATION:\n            if middle.startswith(opening):\n                middle = middle[len(opening):]\n                lead += opening\n                trimmed_something = True\n            if (middle.endswith(closing) and\n                    middle.count(closing) == middle.count(opening) + 1):\n                middle = middle[:-len(closing)]\n                trail = closing + trail\n                trimmed_something = True\n        middle_unescaped = html.unescape(middle)\n        stripped = middle_unescaped.rstrip(TRAILING_PUNCTUATION_CHARS)\n        if middle_unescaped != stripped:\n            trail_length = len(middle_unescaped) - len(stripped)\n            trail = middle[len(middle) - trail_length:] + trail\n            middle = middle[:len(middle) - trail_length]\n            trimmed_something = True\n    return lead, middle, trail
+
+lead, middle, trail = trim_punctuation('', 'google.com/?q=1&lt!', '')
+print('middle:', repr(middle))
+print('trail:', repr(trail))
+# Expected: middle='google.com/?q=1&lt', trail='!'
+EOF
+# Output:
+# middle: 'google.com/?q=1&lt'
+# trail: '!'
+```
+This output confirms the fix correctly separates the `!` as trailing punctuation and keeps `&lt` within the `middle` part.
+
+**Constraints/Environment Facts:**
+- The environment is a Django project.
+- Initial attempts to import `urlize` directly failed due to missing Django dependencies (`asgiref`). The fix was verified by extracting the `trim_punctuation` logic into a standalone script.
+- `TRAILING_PUNCTUATION_CHARS = '.,:;!'`
+- `html.unescape('google.com/?q=1&lt!')` results in `'google.com/?q=1<!'`.
+
+**Risks:**
+- The change to `trim_punctuation` might have unintended side effects on other URL patterns or punctuation handling. However, the logic seems more robust as it correctly accounts for length changes due to HTML entity unescaping.
