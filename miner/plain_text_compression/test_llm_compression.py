@@ -1,15 +1,16 @@
-"""Test an LLM-backed compression miner on local data.
+"""Test a compression miner on local data.
 
 Examples:
     python miner/plain_text_compression/test_llm_compression.py data.jsonl
-    python miner/plain_text_compression/test_llm_compression.py data.csv --field problem_statement
-    python miner/plain_text_compression/test_llm_compression.py data.txt --ratio 0.15 --limit 5
+    python miner/plain_text_compression/test_llm_compression.py data.csv --field challenge_text
+    python miner/plain_text_compression/test_llm_compression.py data.txt --ratio 0.45 --limit 5
 
-For real LLM calls:
+Default miner is algorithmic (no LLM / no network):
+    miner/plain_text_compression/algorithmic_compression_miner.py
+
+Optional LLM miner:
+    --miner miner/plain_text_compression/llm_compression_miner.py
     set OPENROUTER_API_KEY=sk-or-...
-
-Optional:
-    set SOMA_LLM_MODEL=google/gemini-2.5-flash
 """
 
 from __future__ import annotations
@@ -22,8 +23,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-DEFAULT_MINER = Path(__file__).with_name("llm_compression_miner.py")
-DEFAULT_OUTPUT_DIR = Path(__file__).with_name("llm_test_results")
+DEFAULT_MINER = Path(__file__).with_name("algorithmic_compression_miner.py")
+DEFAULT_OUTPUT_DIR = Path(__file__).with_name("algorithmic_test_results")
 TEXT_FIELD_CANDIDATES = (
     "source_text",
     "task",
@@ -37,7 +38,7 @@ TEXT_FIELD_CANDIDATES = (
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run an LLM compression miner on local test data")
+    parser = argparse.ArgumentParser(description="Run a compression miner on local test data")
     parser.add_argument("data_path", help="Path to .jsonl, .json, .csv, or .txt data")
     parser.add_argument("--miner", default=str(DEFAULT_MINER), help="Path to miner python file")
     parser.add_argument("--field", default=None, help="Field/column containing text to compress")

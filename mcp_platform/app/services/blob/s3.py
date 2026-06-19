@@ -15,7 +15,17 @@ class S3BlobStorage(BlobStorage):
         self._bucket = bucket
         self._session = aioboto3.Session()
 
-        self._client_kwargs = {}
+        self._client_kwargs: dict[str, str] = {}
+        endpoint_url = os.getenv("AWS_ENDPOINT_URL", "").strip()
+        if endpoint_url:
+            self._client_kwargs["endpoint_url"] = endpoint_url
+            self._client_kwargs["aws_access_key_id"] = os.getenv("AWS_ACCESS_KEY_ID", "test")
+            self._client_kwargs["aws_secret_access_key"] = os.getenv(
+                "AWS_SECRET_ACCESS_KEY", "test"
+            )
+            region = os.getenv("AWS_DEFAULT_REGION", "").strip()
+            if region:
+                self._client_kwargs["region_name"] = region
 
     async def put_bytes(
         self, key: str, data: bytes, content_type: str | None = None
