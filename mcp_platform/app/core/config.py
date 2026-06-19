@@ -248,6 +248,10 @@ class Settings(BaseSettings):
         default=0.5,
         alias="SWEBENCH_SCREENING_PASS_RATIO",
     )
+    swebench_screening_min_weighted_token_saving_ratio: float = Field(
+        default=0.1,
+        alias="SWEBENCH_SCREENING_MIN_WEIGHTED_TOKEN_SAVING_RATIO",
+    )
     swebench_dynamic_screener_task_count: int = Field(
         default=3,
         alias="SWEBENCH_DYNAMIC_SCREENER_TASK_COUNT",
@@ -415,6 +419,27 @@ class Settings(BaseSettings):
             numeric = float(value)
         except (TypeError, ValueError) as exc:
             raise ValueError("SWEBENCH_SCREENING_PASS_RATIO must be a number") from exc
+        if numeric > 1:
+            if numeric > 100:
+                numeric = 100.0
+            numeric = numeric / 100.0
+        if numeric < 0:
+            numeric = 0.0
+        if numeric > 1:
+            numeric = 1.0
+        return numeric
+
+    @field_validator("swebench_screening_min_weighted_token_saving_ratio", mode="before")
+    @classmethod
+    def _parse_swebench_screening_min_weighted_token_saving_ratio(cls, value: Any) -> float:
+        if value is None or value == "":
+            return 0.1
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "SWEBENCH_SCREENING_MIN_WEIGHTED_TOKEN_SAVING_RATIO must be a number"
+            ) from exc
         if numeric > 1:
             if numeric > 100:
                 numeric = 100.0

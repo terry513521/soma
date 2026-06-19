@@ -74,6 +74,14 @@ def _token_count(value: Any) -> int | None:
     return None
 
 
+def _first_token_count(*candidates: Any) -> int | None:
+    for candidate in candidates:
+        value = _token_count(candidate)
+        if value is not None:
+            return value
+    return None
+
+
 def _step_count(value: Any) -> int | None:
     if isinstance(value, bool):
         return None
@@ -614,17 +622,23 @@ class CompactBenchExecutor:
             row_error_text = str(row.get("error") or "").strip() or None
             stderr_text = process.stderr.strip() or None
             error_text = row_error_text or (None if success else stderr_text)
-            total_tokens, agent_steps = self._extract_execution_metrics(
+            total_tokens, input_tokens, cached_input_tokens, output_tokens, agent_steps = self._extract_execution_metrics(
                 row=row,
                 metadata=row_metadata,
             )
             logger.info(
-                "Benchmark result parsed: run_id=%s status=%s ok_status=%s patch_capture_status=%s total_tokens=%s agent_steps=%s",
+                (
+                    "Benchmark result parsed: run_id=%s status=%s ok_status=%s patch_capture_status=%s "
+                    "total_tokens=%s input_tokens=%s cached_input_tokens=%s output_tokens=%s agent_steps=%s"
+                ),
                 task.run_id,
                 status,
                 success,
                 patch_capture_status,
                 total_tokens,
+                input_tokens,
+                cached_input_tokens,
+                output_tokens,
                 agent_steps,
             )
             if stderr_text:
@@ -652,6 +666,9 @@ class CompactBenchExecutor:
                     "output_dir": str(output_dir),
                     "plugin_path": str(plugin_path),
                     "total_tokens": total_tokens,
+                    "input_tokens": input_tokens,
+                    "cached_input_tokens": cached_input_tokens,
+                    "output_tokens": output_tokens,
                 }
             )
 
@@ -661,6 +678,9 @@ class CompactBenchExecutor:
                 error=error_text,
                 execution_time_seconds=duration,
                 total_tokens=total_tokens,
+                input_tokens=input_tokens,
+                cached_input_tokens=cached_input_tokens,
+                output_tokens=output_tokens,
                 agent_steps=agent_steps,
                 patch_capture_status=patch_capture_status,
                 patch_diff=patch_text or None,
@@ -958,7 +978,31 @@ class CompactBenchExecutor:
         *,
         row: dict[str, Any],
         metadata: dict[str, Any],
-    ) -> tuple[int | None, int | None]:
+    ) -> tuple[int | None, int | None, int | None, int | None, int | None]:
+        token_usage = metadata.get("token_usage") if isinstance(metadata.get("token_usage"), dict) else {}
+        token_usage_total = token_usage.get("total") if isinstance(token_usage.get("total"), dict) else {}
+
+        input_tokens = _first_token_count(
+            row.get("input_tokens"),
+            metadata.get("input_tokens"),
+            token_usage.get("input_tokens"),
+            token_usage_total.get("input_tokens"),
+        )
+        cached_input_tokens = _first_token_count(
+            row.get("cached_input_tokens"),
+            metadata.get("cached_input_tokens"),
+            row.get("cache_read_tokens"),
+            metadata.get("cache_read_tokens"),
+            token_usage.get("cache_read_tokens"),
+            token_usage_total.get("cache_read_tokens"),
+        )
+        output_tokens = _first_token_count(
+            row.get("output_tokens"),
+            metadata.get("output_tokens"),
+            token_usage.get("output_tokens"),
+            token_usage_total.get("output_tokens"),
+        )
+
         total_tokens = None
         for candidate in (
             row.get("total_tokens"),
@@ -972,11 +1016,11 @@ class CompactBenchExecutor:
                 break
 
         if total_tokens is None:
-            token_usage = metadata.get("token_usage")
-            if isinstance(token_usage, dict):
-                total_payload = token_usage.get("total")
-                if isinstance(total_payload, dict):
-                    total_tokens = _token_count(total_payload.get("total_tokens"))
+            total_tokens = _token_count(token_usage_total.get("total_tokens"))
+        if total_tokens is None:
+            split_values = [input_tokens, cached_input_tokens, output_tokens]
+            if any(value is not None for value in split_values):
+                total_tokens = sum(value for value in split_values if value is not None)
 
         agent_steps = None
         for candidate in (
@@ -994,7 +1038,7 @@ class CompactBenchExecutor:
                 agent_steps = value
                 break
 
-        return total_tokens, agent_steps
+        return total_tokens, input_tokens, cached_input_tokens, output_tokens, agent_steps
 
     def shutdown(self) -> None:
         """Release persistent sandbox-side helper resources."""
