@@ -252,6 +252,18 @@ class Settings(BaseSettings):
         default=0.1,
         alias="SWEBENCH_SCREENING_MIN_WEIGHTED_TOKEN_SAVING_RATIO",
     )
+    swebench_screening_input_tokens_weight: float = Field(
+        default=1.0,
+        alias="SWEBENCH_SCREENING_INPUT_TOKENS_WEIGHT",
+    )
+    swebench_screening_cached_input_tokens_weight: float = Field(
+        default=1.0 / 3.0,
+        alias="SWEBENCH_SCREENING_CACHED_INPUT_TOKENS_WEIGHT",
+    )
+    swebench_screening_output_tokens_weight: float = Field(
+        default=3.0,
+        alias="SWEBENCH_SCREENING_OUTPUT_TOKENS_WEIGHT",
+    )
     swebench_dynamic_screener_task_count: int = Field(
         default=3,
         alias="SWEBENCH_DYNAMIC_SCREENER_TASK_COUNT",
@@ -449,6 +461,18 @@ class Settings(BaseSettings):
         if numeric > 1:
             numeric = 1.0
         return numeric
+
+    @field_validator(
+        "swebench_screening_input_tokens_weight",
+        "swebench_screening_cached_input_tokens_weight",
+        "swebench_screening_output_tokens_weight",
+        mode="after",
+    )
+    @classmethod
+    def _validate_swebench_screening_token_weights(cls, value: float) -> float:
+        if value < 0:
+            raise ValueError("SWEBENCH screening token weights must be non-negative")
+        return float(value)
 
     @field_validator("previous_competition_screeners_grace_hours", mode="before")
     @classmethod

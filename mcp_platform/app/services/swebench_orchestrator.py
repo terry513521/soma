@@ -33,9 +33,6 @@ _LAST_CAPACITY_LOG_AT: float | None = None
 _CAPACITY_LOG_INTERVAL_SECONDS = 30.0
 _LAST_IDLE_DISPATCH_LOG_AT: float | None = None
 _DISPATCH_IDLE_LOG_INTERVAL_SECONDS = 30.0
-_SCREENER_INPUT_TOKENS_WEIGHT = 1.0
-_SCREENER_CACHED_INPUT_TOKENS_WEIGHT = 1.0 / 3.0
-_SCREENER_OUTPUT_TOKENS_WEIGHT = 3.0
 
 
 @dataclass(frozen=True)
@@ -771,6 +768,14 @@ def _required_screening_weighted_token_saving_ratio() -> float:
     return min(1.0, max(0.0, ratio))
 
 
+def _screening_token_weights() -> tuple[float, float, float]:
+    return (
+        float(settings.swebench_screening_input_tokens_weight),
+        float(settings.swebench_screening_cached_input_tokens_weight),
+        float(settings.swebench_screening_output_tokens_weight),
+    )
+
+
 def _model_attr(model: type, name: str):
     try:
         return getattr(model, name)
@@ -800,10 +805,11 @@ def _weighted_tokens_for_screening(
         output_value = int(output_tokens)
         if input_value < 0 or cached_value < 0 or output_value < 0:
             return None
+        input_weight, cached_input_weight, output_weight = _screening_token_weights()
         return (
-            (_SCREENER_INPUT_TOKENS_WEIGHT * float(input_value))
-            + (_SCREENER_CACHED_INPUT_TOKENS_WEIGHT * float(cached_value))
-            + (_SCREENER_OUTPUT_TOKENS_WEIGHT * float(output_value))
+            (input_weight * float(input_value))
+            + (cached_input_weight * float(cached_value))
+            + (output_weight * float(output_value))
         )
 
     if total_tokens is None or int(total_tokens) < 0:

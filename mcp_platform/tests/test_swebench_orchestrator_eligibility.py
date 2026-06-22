@@ -88,6 +88,38 @@ def _extract_sql(async_mock: AsyncMock, call_index: int = 0) -> str:
     return str(async_mock.await_args_list[call_index].args[0])
 
 
+def test_weighted_tokens_for_screening_uses_configured_weights(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        orchestrator.settings,
+        "swebench_screening_input_tokens_weight",
+        2.0,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        orchestrator.settings,
+        "swebench_screening_cached_input_tokens_weight",
+        0.5,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        orchestrator.settings,
+        "swebench_screening_output_tokens_weight",
+        4.0,
+        raising=False,
+    )
+
+    weighted = orchestrator._weighted_tokens_for_screening(
+        total_tokens=None,
+        input_tokens=10,
+        cached_input_tokens=8,
+        output_tokens=6,
+    )
+
+    assert weighted == pytest.approx(48.0)
+
+
 @pytest.mark.asyncio
 async def test_seed_selects_dynamic_screeners_once_when_none_selected(
     monkeypatch: pytest.MonkeyPatch,

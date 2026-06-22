@@ -203,9 +203,6 @@ SWE_MINERS_SNAPSHOT_CACHE_VERSION = "v1"
 SWE_ROWS_SNAPSHOT_TTL_SECONDS = 300
 SWE_MINERS_SNAPSHOT_TTL_SECONDS = 300
 _swe_rows_snapshot_build_lock = asyncio.Lock()
-_SCREENER_INPUT_TOKENS_WEIGHT = 1.0
-_SCREENER_CACHED_INPUT_TOKENS_WEIGHT = 1.0 / 3.0
-_SCREENER_OUTPUT_TOKENS_WEIGHT = 3.0
 
 
 def _invalid_api_key_error() -> HTTPException:
@@ -750,6 +747,14 @@ def _required_screener_weighted_token_saving_ratio() -> float:
     return min(1.0, max(0.0, ratio))
 
 
+def _screening_token_weights() -> tuple[float, float, float]:
+    return (
+        float(settings.swebench_screening_input_tokens_weight),
+        float(settings.swebench_screening_cached_input_tokens_weight),
+        float(settings.swebench_screening_output_tokens_weight),
+    )
+
+
 def _to_optional_int(value: object) -> int | None:
     if value is None:
         return None
@@ -774,10 +779,11 @@ def _weighted_tokens_for_screening(
     if parsed_input is not None and parsed_cached is not None and parsed_output is not None:
         if parsed_input < 0 or parsed_cached < 0 or parsed_output < 0:
             return None
+        input_weight, cached_input_weight, output_weight = _screening_token_weights()
         return (
-            (_SCREENER_INPUT_TOKENS_WEIGHT * float(parsed_input))
-            + (_SCREENER_CACHED_INPUT_TOKENS_WEIGHT * float(parsed_cached))
-            + (_SCREENER_OUTPUT_TOKENS_WEIGHT * float(parsed_output))
+            (input_weight * float(parsed_input))
+            + (cached_input_weight * float(parsed_cached))
+            + (output_weight * float(parsed_output))
         )
 
     if parsed_total is None or parsed_total < 0:
