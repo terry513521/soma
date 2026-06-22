@@ -82,6 +82,16 @@ def _extract_compact_bench_error(payload: CompactBenchReportRequest) -> str | No
     return None
 
 
+def _coerce_optional_non_negative_int(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float) and value.is_integer() and value >= 0:
+        return int(value)
+    return None
+
+
 async def _persist_compact_bench_report(
     db: AsyncSession,
     *,
@@ -122,9 +132,62 @@ async def _persist_compact_bench_report(
                 },
             )
 
+    input_tokens = _coerce_optional_non_negative_int(getattr(payload, "input_tokens", None))
+    cached_input_tokens = _coerce_optional_non_negative_int(
+        getattr(payload, "cached_input_tokens", None)
+    )
+    output_tokens = _coerce_optional_non_negative_int(getattr(payload, "output_tokens", None))
+    resolved_total_tokens = _coerce_optional_non_negative_int(payload.total_tokens)
+    if resolved_total_tokens is None:
+        split_values = [input_tokens, cached_input_tokens, output_tokens]
+        if any(value is not None for value in split_values):
+            resolved_total_tokens = sum(value for value in split_values if value is not None)
+
     run.agent_steps = payload.agent_steps
-    run.tokens_used = payload.total_tokens
+    run.tokens_used = resolved_total_tokens
+    for field_name, value in (
+        ("input_tokens", input_tokens),
+        ("cached_input_tokens", cached_input_tokens),
+        ("output_tokens", output_tokens),
+    ):
+        if _model_attr(SweBenchRun, field_name) is not None:
+            setattr(run, field_name, value)
     run.time_taken_seconds = payload.execution_time_seconds
+    if any(
+        _model_attr(SweBenchRun, field_name) is None
+        for field_name in ("input_tokens", "cached_input_tokens", "output_tokens")
+    ) and any(value is not None for value in (input_tokens, cached_input_tokens, output_tokens)):
+        # Backward compatibility when ORM model doesn't expose split token fields,
+        # but the DB table already includes these columns.
+        try:
+            await db.execute(
+                text(
+                    """
+                    UPDATE swe_bench_runs
+                    SET input_tokens = :input_tokens,
+                        cached_input_tokens = :cached_input_tokens,
+                        output_tokens = :output_tokens,
+                        updated_at = now()
+                    WHERE id = :run_id
+                    """
+                ),
+                {
+                    "input_tokens": input_tokens,
+                    "cached_input_tokens": cached_input_tokens,
+                    "output_tokens": output_tokens,
+                    "run_id": int(payload.run_id),
+                },
+            )
+        except Exception:
+            logger.exception(
+                "compact_bench_report_split_token_persist_failed",
+                extra={
+                    "run_id": payload.run_id,
+                    "input_tokens": input_tokens,
+                    "cached_input_tokens": cached_input_tokens,
+                    "output_tokens": output_tokens,
+                },
+            )
     extracted_error = _extract_compact_bench_error(payload)
     desired_status = "completed" if (payload.ok_status and payload.patch_capture_status) else "failed"
     if patch_save_error:
@@ -175,6 +238,10 @@ async def _persist_compact_bench_report(
             "patch_capture_status": payload.patch_capture_status,
             "patch_saved": patch_saved,
             "status": desired_status,
+            "tokens_used": resolved_total_tokens,
+            "input_tokens": input_tokens,
+            "cached_input_tokens": cached_input_tokens,
+            "output_tokens": output_tokens,
             "has_error": bool(resolved_last_error),
             "error_excerpt": (resolved_last_error or "")[:240],
         },

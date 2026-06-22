@@ -88,6 +88,38 @@ def _extract_sql(async_mock: AsyncMock, call_index: int = 0) -> str:
     return str(async_mock.await_args_list[call_index].args[0])
 
 
+def test_weighted_tokens_for_screening_uses_configured_weights(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        orchestrator.settings,
+        "swebench_screening_input_tokens_weight",
+        2.0,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        orchestrator.settings,
+        "swebench_screening_cached_input_tokens_weight",
+        0.5,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        orchestrator.settings,
+        "swebench_screening_output_tokens_weight",
+        4.0,
+        raising=False,
+    )
+
+    weighted = orchestrator._weighted_tokens_for_screening(
+        total_tokens=None,
+        input_tokens=10,
+        cached_input_tokens=8,
+        output_tokens=6,
+    )
+
+    assert weighted == pytest.approx(48.0)
+
+
 @pytest.mark.asyncio
 async def test_seed_selects_dynamic_screeners_once_when_none_selected(
     monkeypatch: pytest.MonkeyPatch,
@@ -152,6 +184,88 @@ async def test_seed_skips_dynamic_reselection_when_screeners_already_selected(
 
     assert created == 0
     assert select_screeners_mock.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_evaluate_screening_passes_with_weighted_token_saving_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(timezone.utc)
+    db = AsyncMock()
+    db.execute = AsyncMock(
+        side_effect=[
+            _ExecuteResult(
+                all_rows=[
+                    (101, 1, True, now, None, 100, 300, 10),
+                    (102, 1, True, now, None, 80, 60, 10),
+                ]
+            ),
+            _ExecuteResult(
+                all_rows=[
+                    (101, 1, None, 150, 300, 20),
+                    (102, 1, None, 120, 120, 20),
+                ]
+            ),
+        ]
+    )
+
+    monkeypatch.setattr(orchestrator.settings, "swebench_screening_pass_ratio", 1.0, raising=False)
+    monkeypatch.setattr(orchestrator.settings, "swebench_screening_min_passed_tasks", 0, raising=False)
+    monkeypatch.setattr(
+        orchestrator.settings,
+        "swebench_screening_min_weighted_token_saving_ratio",
+        0.1,
+        raising=False,
+    )
+
+    complete, passed = await orchestrator._evaluate_screening_for_script(
+        db,
+        script=orchestrator._ScriptRef(script_id=2001, miner_fk=3001),
+        screener_task_ids=[101, 102],
+        task_repeats={101: 1, 102: 1},
+    )
+
+    assert (complete, passed) == (True, True)
+
+
+@pytest.mark.asyncio
+async def test_evaluate_screening_fails_when_weighted_token_saving_is_below_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(timezone.utc)
+    db = AsyncMock()
+    db.execute = AsyncMock(
+        side_effect=[
+            _ExecuteResult(
+                all_rows=[
+                    (101, 1, True, now, None, 95, 0, 0),
+                ]
+            ),
+            _ExecuteResult(
+                all_rows=[
+                    (101, 1, None, 100, 0, 0),
+                ]
+            ),
+        ]
+    )
+
+    monkeypatch.setattr(orchestrator.settings, "swebench_screening_pass_ratio", 1.0, raising=False)
+    monkeypatch.setattr(orchestrator.settings, "swebench_screening_min_passed_tasks", 1, raising=False)
+    monkeypatch.setattr(
+        orchestrator.settings,
+        "swebench_screening_min_weighted_token_saving_ratio",
+        0.1,
+        raising=False,
+    )
+
+    complete, passed = await orchestrator._evaluate_screening_for_script(
+        db,
+        script=orchestrator._ScriptRef(script_id=2002, miner_fk=3002),
+        screener_task_ids=[101],
+        task_repeats={101: 1},
+    )
+
+    assert (complete, passed) == (True, False)
 
 
 @pytest.mark.asyncio
