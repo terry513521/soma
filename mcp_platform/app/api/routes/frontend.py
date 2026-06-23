@@ -1464,11 +1464,6 @@ async def _get_competition_aggregate_impl(
             evaluation_end=timeframe_row.eval_ends_at,
         )
 
-    upload_ends_at = timeframe.upload_end if timeframe is not None else None
-    if upload_ends_at is not None and upload_ends_at.tzinfo is None:
-        upload_ends_at = upload_ends_at.replace(tzinfo=timezone.utc)
-    eval_started = upload_ends_at is not None and datetime.now(timezone.utc) >= upload_ends_at
-
     rows_snapshot = await _build_swe_rows_snapshot(db, comp_id=competition_id)
     miners_snapshot = await _build_swe_miners_snapshot(
         db,
@@ -1534,11 +1529,7 @@ async def _get_competition_aggregate_impl(
         for group in sorted(task_groups.values(), key=lambda group: int(group["task_id"])):
             task_item = build_swe_task_result_item(group).model_copy(
                 update={
-                    "task_name": (
-                        str(group["task_name"])
-                        if eval_started
-                        else TEXT_HIDDEN_PLACEHOLDER
-                    )
+                    "task_name": str(group["task_name"])
                 }
             )
             runs = sorted(
